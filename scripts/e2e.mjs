@@ -168,7 +168,14 @@ async function main() {
     const pendingEmp = await api("/api/ai/chat", { method: "POST", body: { message: "Show me pending approvals" }, cookie: emp });
     check("employee asking for the approval queue is refused", pendingEmp.data?.refused === true || /not authorized/i.test(pendingEmp.data?.answer ?? ""));
     const pendingHr = await api("/api/ai/chat", { method: "POST", body: { message: "Show me pending approvals" }, cookie: hr });
-    check("HR sees the pending approval queue", pendingHr.status === 200 && /pending approval/i.test(pendingHr.data?.answer ?? ""));
+    // Grounding check, not phrasing: a real model may word the answer its own
+    // way, but it must name an actually-pending requester from the tool result.
+    check(
+      "HR sees the pending approval queue (grounded)",
+      pendingHr.status === 200 && !pendingHr.data?.refused &&
+        /Muhammad Taha|Ahmed Raza/.test(pendingHr.data?.answer ?? ""),
+      pendingHr.data?.answer?.slice(0, 120)
+    );
     const urdu = await api("/api/ai/chat", { method: "POST", body: { message: "میری چھٹی کا بیلنس کتنا ہے؟" }, cookie: emp });
     check("Urdu input gets an Urdu reply", /چھٹی|بیلنس/.test(urdu.data?.answer ?? ""));
   }
