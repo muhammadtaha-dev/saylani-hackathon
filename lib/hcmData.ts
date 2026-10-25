@@ -8,6 +8,7 @@
  */
 
 import { hashPassword } from "./auth";
+import { loadPersistedState, savePersistedState } from "./persistence";
 
 export type Role = "admin" | "hr" | "employee";
 export type DepartmentName = "Engineering" | "Sales" | "HR";
@@ -518,6 +519,8 @@ export function addEmployee(input: NewEmployeeInput): Employee {
     passwordHash: hashPassword(input.password),
   };
   EMPLOYEES.push(employee);
+  addedEmployees.push(employee);
+  persistState();
   return employee;
 }
 
@@ -528,7 +531,51 @@ export function setEmployeeStatus(
 ): Employee | undefined {
   const employee = findEmployeeById(id);
   if (employee) employee.status = status;
+  if (!SEED_EMPLOYEE_IDS.has(id)) statusOverrides[id] = status;
+  persistState();
   return employee;
+}
+
+/** Set a leave request's status (approve/reject) and persist the decision. */
+export function setLeaveRequestStatus(
+  id: string,
+  status: LeaveStatus
+): LeaveRequest | undefined {
+  const leaveRequest = LEAVE_REQUESTS.find((lr) => lr.id === id);
+  if (leaveRequest) leaveRequest.status = status;
+  if (!SEED_LEAVE_IDS.has(id)) leaveStatusOverrides[id] = status;
+  persistState();
+  return leaveRequest;
+}
+
+// ---- Persistence: user/leave mutations survive server restarts -----------
+
+const SEED_EMPLOYEE_IDS = new Set(EMPLOYEES.map((e) => e.id));
+const SEED_LEAVE_IDS = new Set(LEAVE_REQUESTS.map((lr) => lr.id));
+
+const persisted = loadPersistedState();
+const addedEmployees = (persisted?.addedEmployees as Employee[] | undefined) ?? [];
+const statusOverrides = (persisted?.statusOverrides as Record<string, string>) ?? {};
+const extraLeaves = (persisted?.extraLeaves as LeaveRequest[] | undefined) ?? [];
+const leaveStatusOverrides = (persisted?.leaveStatusOverrides as Record<string, string>) ?? {};
+
+for (const employee of addedEmployees) {
+  if (!findEmployeeById(employee.id)) EMPLOYEES.push(employee);
+}
+for (const [id, status] of Object.entries(statusOverrides)) {
+  const employee = findEmployeeById(id);
+  if (employee) employee.status = status as EmploymentStatus;
+}
+for (const leave of extraLeaves) {
+  if (!LEAVE_REQUESTS.some((lr) => lr.id === leave.id)) LEAVE_REQUESTS.push(leave);
+}
+for (const [id, status] of Object.entries(leaveStatusOverrides)) {
+  const leave = LEAVE_REQUESTS.find((lr) => lr.id === id);
+  if (leave) leave.status = status as LeaveStatus;
+}
+
+function persistState(): void {
+  savePersistedState({ addedEmployees, statusOverrides, extraLeaves, leaveStatusOverrides });
 }
 
 // ---- Lookups -------------------------------------------------------------
@@ -544,4 +591,6 @@ export function findEmployeeByEmail(email: string): Employee | undefined {
 /** Append-only friendly store for new leave requests made through the app. */
 export function addLeaveRequest(request: LeaveRequest): void {
   LEAVE_REQUESTS.push(request);
+  extraLeaves.push(request);
+  persistState();
 }

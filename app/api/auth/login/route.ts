@@ -28,9 +28,16 @@ export async function POST(request: Request) {
   }
 
   const user = findEmployeeByEmail(email);
-  if (!user || !verifyPassword(password, user.passwordHash ?? "")) {
+  if (!user) {
     recordLoginFailure(email);
-    return Response.json({ error: "Invalid email or password." }, { status: 401 });
+    return Response.json(
+      { error: "No account found with this email. Please ask an Admin or HR to create your login." },
+      { status: 401 }
+    );
+  }
+  if (!verifyPassword(password, user.passwordHash ?? "")) {
+    recordLoginFailure(email);
+    return Response.json({ error: "Incorrect password. Please try again." }, { status: 401 });
   }
   if (user.status !== "active") {
     return Response.json(

@@ -13,6 +13,7 @@ import {
   ATTENDANCE_RECORDS,
   findEmployeeById,
   LEAVE_REQUESTS,
+  setLeaveRequestStatus,
   type LeaveStatus,
   type LeaveType,
 } from "@/lib/hcmData";
@@ -163,7 +164,7 @@ export async function PATCH(request: Request) {
     );
   }
 
-  leaveRequest.status = status;
+  setLeaveRequestStatus(id, status);
 
   // Keep attendance consistent with the approved leave (seeded days only).
   if (status === "approved") {
