@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
-import { Wand2, CheckCircle2, ShieldAlert, RotateCcw } from "lucide-react";
+import { useRef, useState } from "react";
+import { Wand2, CheckCircle2, ShieldAlert, RotateCcw, Paperclip } from "lucide-react";
 import { AiBadge } from "./ai-badge";
+import { supabaseBrowser, supabaseBrowserConfigured } from "@/lib/supabase/client";
 import type { LeaveSuggestionClient } from "./types";
 
 /**
@@ -18,11 +19,48 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
   const [form, setForm] = useState({ type: "casual", start: "", end: "", reason: "" });
   const [submitting, setSubmitting] = useState(false);
   const [riskNote, setRiskNote] = useState<string | null>(null);
+  const [attachment, setAttachment] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   function resetForm() {
     setAiSuggested(false);
     setRiskNote(null);
     setForm({ type: "casual", start: "", end: "", reason: "" });
+    setAttachment(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  /**
+   * Optional supporting document (Checklist D.15). Uploaded straight to the
+   * private `leave-attachments` storage bucket under the caller's own folder
+   * (per-user storage policy); the leave request stores only the path.
+   */
+  async function uploadAttachment(leaveId: string): Promise<string | null> {
+    if (!attachment) return null;
+    if (!supabaseBrowserConfigured()) {
+      setNotice({ tone: "error", text: "Attachments need the database connection — submitting without the file." });
+      return null;
+    }
+    const supabase = supabaseBrowser();
+    if (!supabase) return null;
+    setUploading(true);
+    try {
+      const { data: userData } = await supabase.auth.getUser();
+      const uid = userData.user?.id;
+      if (!uid) return null;
+      const path = `${uid}/${leaveId}/${attachment.name.replace(/[^\w.\-() ]+/g, "_")}`;
+      const { error } = await supabase.storage
+        .from("leave-attachments")
+        .upload(path, attachment, { upsert: true });
+      if (error) {
+        setNotice({ tone: "error", text: `Attachment upload failed (${error.message}) — submitting without the file.` });
+        return null;
+      }
+      return `leave-attachments/${path}`;
+    } finally {
+      setUploading(false);
+    }
   }
 
   async function suggest() {
@@ -74,10 +112,17 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
     setSubmitting(true);
     setNotice(null);
     try {
+      // A client-generated id lets the attachment land in the request's own
+      // folder before the request row exists.
+      const leaveId =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `lr-${Date.now()}`;
+      const attachmentPath = await uploadAttachment(leaveId);
       const res = await fetch("/api/leaves", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({ id: leaveId, ...form, attachment_path: attachmentPath }),
       });
       const data = (await res.json()) as {
         request?: { id: string };
@@ -91,7 +136,7 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
       }
       setNotice({
         tone: "success",
-        text: `Leave request ${data.request?.id ?? ""} submitted — it is now pending approval by HR.`,
+        text: `Leave request submitted — it is now pending approval by HR.${attachmentPath ? " Your attachment is linked." : ""}`,
       });
       setRiskNote(data.risk_note ?? null);
       setDescription("");
@@ -212,15 +257,15 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
         </label>
       </div>
 
-      <div className="mt-4 flex flex-wrap gap-2">
+      <div className="mt-4 flex flex-wrap items-center gap-2">
         <button
           type="button"
           onClick={submit}
-          disabled={submitting || !form.start || !form.end || !form.reason.trim()}
+          disabled={submitting || uploading || !form.start || !form.end || !form.reason.trim()}
           className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           <CheckCircle2 className="h-4 w-4" aria-hidden />
-          {submitting ? "Submitting…" : "Confirm & Submit"}
+          {submitting || uploading ? "Submitting…" : "Confirm & Submit"}
         </button>
         <button
           type="button"
@@ -233,6 +278,18 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
           <RotateCcw className="h-4 w-4" aria-hidden />
           Clear form
         </button>
+        <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-600 transition hover:bg-slate-50">
+          <Paperclip className="h-3.5 w-3.5" aria-hidden />
+          {attachment ? attachment.name.slice(0, 24) : "Attach document (optional)"}
+          <input
+            ref={fileInputRef}
+            type="file"
+            className="sr-only"
+            accept=".pdf,.png,.jpg,.jpeg,.webp,.doc,.docx"
+            onChange={(e) => setAttachment(e.target.files?.[0] ?? null)}
+            aria-label="Attach a supporting document (PDF or image, max 5 MB)"
+          />
+        </label>
       </div>
     </section>
   );

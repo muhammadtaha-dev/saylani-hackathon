@@ -1,29 +1,10 @@
 /**
- * HCM Lite — password hashing + login throttling.
+ * HCM Lite — login throttling.
  *
- * Passwords are stored as scrypt hashes (salt:hash) and never leave the
- * data layer. Failed logins are throttled per email to blunt brute force.
+ * Passwords are verified by Supabase Auth (bcrypt server-side); this module
+ * only keeps the per-email brute-force lock in front of it: 8 failures →
+ * 15-minute lock.
  */
-
-import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
-
-export function hashPassword(password: string): string {
-  const salt = randomBytes(16).toString("hex");
-  const hash = scryptSync(password, salt, 64).toString("hex");
-  return `${salt}:${hash}`;
-}
-
-export function verifyPassword(password: string, stored: string): boolean {
-  if (!stored || !stored.includes(":")) return false;
-  const [salt, hash] = stored.split(":");
-  const candidate = scryptSync(password, salt, 64);
-  const expected = Buffer.from(hash, "hex");
-  return candidate.length === expected.length && timingSafeEqual(candidate, expected);
-}
-
-// ---------------------------------------------------------------------------
-// Failed-login throttle: lock an email for 15 minutes after 8 failures.
-// ---------------------------------------------------------------------------
 
 const MAX_ATTEMPTS = 8;
 const LOCK_MS = 15 * 60 * 1000;

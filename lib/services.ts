@@ -1,29 +1,20 @@
 /**
  * HCM Lite — service layer. THE single source of truth for every metric.
  *
- * The dashboard UI, the REST endpoints and the AI tools all call these
+ * Supabase edition: every function receives the caller's USER-SCOPED client
+ * (their JWT), so Row Level Security bounds what any query can return, and
+ * the service additionally narrows queries by role scope:
+ *   employee → own rows · manager → own + direct reports · hr/admin → all.
+ * The dashboard UI, the REST endpoints and the AI tools all call these same
  * functions, so an AI answer and the dashboard can never disagree
- * (Constitution Art. IV.3, NFR-11). Business definitions — "active", "late",
- * "attendance rate", "this month", "this year" — are defined exactly once,
- * here, and echoed in every result's meta so answers state their period.
+ * (Constitution Art. IV.3, NFR-11).
  */
 
-import {
-  ATTENDANCE_RECORDS,
-  DEPARTMENTS,
-  EMPLOYEES,
-  LEAVE_ENTITLEMENTS,
-  LEAVE_REQUESTS,
-  LEAVE_TYPES,
-  type DepartmentName,
-  type Employee,
-  type EmploymentStatus,
-  type LeaveStatus,
-  type LeaveType,
-} from "./hcmData";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Role } from "./permissions";
 
 // ---------------------------------------------------------------------------
-// Shared definitions (T0.3) — imported by dashboard, tools and prompts alike.
+// Shared definitions (T0.3)
 // ---------------------------------------------------------------------------
 
 export const TIMEZONE = "Asia/Karachi";
@@ -33,7 +24,7 @@ export const ATTENDANCE_RATE_DEFINITION =
   "(present + late) / (present + late + absent) x 100; days on approved leave are excluded";
 export const ACTIVE_DEFINITION =
   "an employee whose employment status is 'active'";
-export const POLICY_VERSION = "2026-10-24.v1";
+export const POLICY_VERSION = "2026-10-25.v2";
 
 export interface PeriodInfo {
   key: string;
@@ -41,6 +32,12 @@ export interface PeriodInfo {
   start: string; // YYYY-MM-DD inclusive
   end: string; // YYYY-MM-DD inclusive
   timezone: string;
+}
+
+export interface Scope {
+  userId: string;
+  role: Role;
+  department?: string;
 }
 
 /** Current date in the app timezone, as YYYY-MM-DD parts. */
@@ -69,10 +66,7 @@ function daysInMonth(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
-/**
- * Resolve a period string ("this_month" | "last_month" | "this_year" |
- * "YYYY-MM" | "YYYY") into explicit start/end in the app timezone.
- */
+/** Resolve a period ("this_month" | "last_month" | "this_year" | "YYYY-MM" | "YYYY"). */
 export function resolvePeriod(period?: string): PeriodInfo {
   const now = todayInTimezone();
   const key = period && period.trim() ? period.trim().toLowerCase() : "this_month";
@@ -117,7 +111,6 @@ export function resolvePeriod(period?: string): PeriodInfo {
       timezone: TIMEZONE,
     };
   }
-  // Default: this month.
   const mm = String(now.month).padStart(2, "0");
   return {
     key: `${now.year}-${mm}`,
@@ -129,25 +122,106 @@ export function resolvePeriod(period?: string): PeriodInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Row types (mirror of the SQL migrations)
+// ---------------------------------------------------------------------------
+
+export interface ProfileRow {
+  id: string;
+  email: string | null;
+  full_name: string;
+  role: Role;
+  manager_id: string | null;
+  department: string;
+  designation: string | null;
+  status: "active" | "inactive";
+}
+
+export interface AttendanceRow {
+  id: string;
+  employee_id: string;
+  date: string;
+  status: "present" | "late" | "absent" | "leave" | "half_day";
+  check_in: string | null;
+  check_out: string | null;
+}
+
+export interface LeaveRequestRow {
+  id: string;
+  employee_id: string;
+  leave_type_id: "annual" | "sick" | "casual";
+  start_date: string;
+  end_date: string;
+  days: number;
+  status: "pending" | "approved" | "rejected" | "cancelled";
+  reason: string;
+  decision_comment: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  attachment_path: string | null;
+  applied_at: string;
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function employeesInScope(department?: string): Employee[] {
-  return EMPLOYEES.filter(
-    (e) => !department || e.department === department
-  );
+/**
+ * Profile ids the caller may aggregate over. null = "all rows visible to the
+ * caller" (HR/Admin without a department filter). RLS remains the hard
+ * backstop — this just keeps manager/team semantics explicit.
+ */
+async function resolveScopeIds(
+  db: SupabaseClient,
+  scope: Scope
+): Promise<string[] | null> {
+  if (scope.role === "employee") return [scope.userId];
+
+  if (scope.role === "manager") {
+    const ids = [scope.userId];
+    const { data: reports } = await db
+      .from("profiles")
+      .select("id")
+      .eq("manager_id", scope.userId)
+      .eq("status", "active");
+    for (const r of reports ?? []) ids.push(r.id);
+    if (scope.department) {
+      const filtered = new Set<string>();
+      for (const id of ids) {
+        // keep only ids in the requested department
+        const { data } = await db
+          .from("profiles")
+          .select("id, department")
+          .eq("id", id)
+          .eq("department", scope.department);
+        if (data && data.length > 0) filtered.add(id);
+      }
+      return [...filtered];
+    }
+    return ids;
+  }
+
+  // HR/Admin: department filter or everything.
+  if (scope.department) {
+    const { data } = await db
+      .from("profiles")
+      .select("id")
+      .eq("department", scope.department);
+    return (data ?? []).map((p) => p.id);
+  }
+  return null;
 }
 
-function recordsInPeriod(period: PeriodInfo, department?: string) {
-  const inScope = new Set(
-    employeesInScope(department).map((e) => e.id)
-  );
-  return ATTENDANCE_RECORDS.filter(
-    (r) => r.date >= period.start && r.date <= period.end && inScope.has(r.employeeId)
-  );
+async function profilesForDepartment(
+  db: SupabaseClient,
+  department?: string
+): Promise<ProfileRow[]> {
+  let query = db.from("profiles").select("*").eq("status", "active");
+  if (department) query = query.eq("department", department);
+  const { data } = await query;
+  return (data ?? []) as ProfileRow[];
 }
 
-function summarizeAttendance(records: typeof ATTENDANCE_RECORDS) {
+function summarizeAttendance(records: AttendanceRow[]) {
   let present = 0, late = 0, absent = 0, onLeave = 0;
   const dates = new Set<string>();
   for (const r of records) {
@@ -163,28 +237,50 @@ function summarizeAttendance(records: typeof ATTENDANCE_RECORDS) {
   return { present, late, absent, on_leave: onLeave, working_days: dates.size, attendance_rate: rate };
 }
 
+async function attendanceInPeriod(
+  db: SupabaseClient,
+  period: PeriodInfo,
+  scopeIds: string[] | null
+): Promise<AttendanceRow[]> {
+  let query = db
+    .from("attendance")
+    .select("*")
+    .gte("date", period.start)
+    .lte("date", period.end);
+  if (scopeIds) query = query.in("employee_id", scopeIds);
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+  return (data ?? []) as AttendanceRow[];
+}
+
 // ---------------------------------------------------------------------------
-// Services (one function per metric — no business logic lives anywhere else)
+// Services
 // ---------------------------------------------------------------------------
 
 export interface HeadcountResult {
   department: string;
-  status: EmploymentStatus | "all";
+  status: "active" | "inactive" | "all";
   count: number;
   as_of: string;
 }
 
-export function getHeadcountService(
-  department?: DepartmentName,
-  status: EmploymentStatus | "all" = "active"
-): HeadcountResult {
-  const all = employeesInScope(department);
-  const count =
-    status === "all" ? all.length : all.filter((e) => e.status === status).length;
+export async function getHeadcountService(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string,
+  status: "active" | "inactive" | "all" = "active"
+): Promise<HeadcountResult> {
+  const ids = await resolveScopeIds(db, scope);
+  let query = db.from("profiles").select("id, status");
+  if (ids) query = query.in("id", ids.length ? ids : ["00000000-0000-0000-0000-000000000000"]);
+  if (department) query = query.eq("department", department);
+  if (status !== "all") query = query.eq("status", status);
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
   return {
     department: department ?? "All departments",
     status,
-    count,
+    count: (data ?? []).length,
     as_of: todayIso(),
   };
 }
@@ -200,29 +296,33 @@ export interface AttendanceSummaryResult {
   definition: string;
 }
 
-export function getAttendanceSummaryService(
-  department?: DepartmentName,
+export async function getAttendanceSummaryService(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string,
   period?: string
-): AttendanceSummaryResult {
+): Promise<AttendanceSummaryResult> {
   const p = resolvePeriod(period);
-  const summary = summarizeAttendance(recordsInPeriod(p, department));
-  return {
-    period: p,
-    ...summary,
-    definition: ATTENDANCE_RATE_DEFINITION,
-  };
+  const ids = await resolveScopeIds(db, scope);
+  const records = await attendanceInPeriod(db, p, ids);
+  return { period: p, ...summarizeAttendance(records), definition: ATTENDANCE_RATE_DEFINITION };
 }
 
-/** Own-record attendance summary for an employee (3.3: own record only). */
-export function getMyAttendanceSummaryService(
+/** Own-record attendance summary (employee scope). */
+export async function getMyAttendanceSummaryService(
+  db: SupabaseClient,
   userId: string,
   period?: string
-): AttendanceSummaryResult {
+): Promise<AttendanceSummaryResult> {
   const p = resolvePeriod(period);
-  const records = ATTENDANCE_RECORDS.filter(
-    (r) => r.employeeId === userId && r.date >= p.start && r.date <= p.end
-  );
-  return { period: p, ...summarizeAttendance(records), definition: ATTENDANCE_RATE_DEFINITION };
+  const { data, error } = await db
+    .from("attendance")
+    .select("*")
+    .eq("employee_id", userId)
+    .gte("date", p.start)
+    .lte("date", p.end);
+  if (error) throw new Error(error.message);
+  return { period: p, ...summarizeAttendance((data ?? []) as AttendanceRow[]), definition: ATTENDANCE_RATE_DEFINITION };
 }
 
 export interface LateComer {
@@ -239,29 +339,39 @@ export interface LateComersResult {
   ranking: LateComer[];
 }
 
-export function getLateComersService(
-  department?: DepartmentName,
+export async function getLateComersService(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string,
   period?: string,
   limit = 5
-): LateComersResult {
+): Promise<LateComersResult> {
   const p = resolvePeriod(period);
   const cap = Math.min(Math.max(limit, 1), 10);
+  const ids = await resolveScopeIds(db, scope);
+  const records = await attendanceInPeriod(db, p, ids);
   const counts = new Map<string, number>();
-  for (const r of recordsInPeriod(p, department)) {
-    if (r.status === "late") {
-      counts.set(r.employeeId, (counts.get(r.employeeId) ?? 0) + 1);
+  for (const r of records) {
+    if (r.status === "late") counts.set(r.employee_id, (counts.get(r.employee_id) ?? 0) + 1);
+  }
+  const names = new Map<string, { name: string; department: string }>();
+  const idList = [...counts.keys()];
+  if (idList.length > 0) {
+    const { data } = await db
+      .from("profiles")
+      .select("id, full_name, department")
+      .in("id", idList);
+    for (const p of data ?? []) {
+      names.set(p.id, { name: p.full_name, department: p.department });
     }
   }
   const ranking = [...counts.entries()]
-    .map(([id, lateCount]) => {
-      const emp = EMPLOYEES.find((e) => e.id === id)!;
-      return {
-        employee_id: id,
-        name: emp.name,
-        department: emp.department,
-        late_count: lateCount,
-      };
-    })
+    .map(([id, lateCount]) => ({
+      employee_id: id,
+      name: names.get(id)?.name ?? id,
+      department: names.get(id)?.department ?? "",
+      late_count: lateCount,
+    }))
     .sort((a, b) => b.late_count - a.late_count || a.name.localeCompare(b.name))
     .slice(0, cap);
   return { period: p, late_cutoff: LATE_CUTOFF, timezone: TIMEZONE, ranking };
@@ -270,20 +380,32 @@ export function getLateComersService(
 export interface LeaveSummaryResult {
   period: PeriodInfo;
   by_type_and_status: Record<
-    LeaveType,
-    Record<LeaveStatus, { requests: number; days: number }>
+    "annual" | "sick" | "casual",
+    Record<"approved" | "pending" | "rejected" | "cancelled", { requests: number; days: number }>
   >;
 }
 
-export function getLeaveSummaryService(
-  department?: DepartmentName,
+export async function getLeaveSummaryService(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string,
   period?: string,
-  type?: LeaveType
-): LeaveSummaryResult {
+  type?: "annual" | "sick" | "casual"
+): Promise<LeaveSummaryResult> {
   const p = resolvePeriod(period);
-  const inScope = new Set(employeesInScope(department).map((e) => e.id));
+  const ids = await resolveScopeIds(db, scope);
+  let query = db
+    .from("leave_requests")
+    .select("*")
+    .gte("start_date", p.start)
+    .lte("end_date", p.end);
+  if (ids) query = query.in("employee_id", ids.length ? ids : ["00000000-0000-0000-0000-000000000000"]);
+  if (type) query = query.eq("leave_type_id", type);
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+
   const result = {} as LeaveSummaryResult["by_type_and_status"];
-  for (const t of LEAVE_TYPES) {
+  for (const t of ["annual", "sick", "casual"] as const) {
     if (type && t !== type) continue;
     result[t] = {
       approved: { requests: 0, days: 0 },
@@ -292,21 +414,18 @@ export function getLeaveSummaryService(
       cancelled: { requests: 0, days: 0 },
     };
   }
-  for (const lr of LEAVE_REQUESTS) {
-    if (!inScope.has(lr.employeeId)) continue;
-    if (lr.end < p.start || lr.start > p.end) continue;
-    if (type && lr.type !== type) continue;
-    const cell = result[lr.type]?.[lr.status];
+  for (const lr of (data ?? []) as LeaveRequestRow[]) {
+    const cell = result[lr.leave_type_id]?.[lr.status];
     if (cell) {
       cell.requests += 1;
-      cell.days += lr.days;
+      cell.days += Number(lr.days);
     }
   }
   return { period: p, by_type_and_status: result };
 }
 
 export interface LeaveBalance {
-  type: LeaveType;
+  type: "annual" | "sick" | "casual";
   entitled: number;
   used_approved: number;
   pending: number;
@@ -318,33 +437,60 @@ export interface MyLeaveBalanceResult {
   balances: LeaveBalance[];
 }
 
-/**
- * Caller's own balance. Pending leaves are NOT deducted: only approved
- * leaves consume quota (AT-04). No user parameter is ever taken from input.
- */
-export function getMyLeaveBalanceService(
-  userId: string,
-  year?: number
-): MyLeaveBalanceResult {
-  const y = year ?? todayInTimezone().year;
-  const balances = LEAVE_TYPES.map((t) => {
-    const mine = LEAVE_REQUESTS.filter(
-      (lr) =>
-        lr.employeeId === userId &&
-        lr.type === t &&
-        Number(lr.start.slice(0, 4)) === y
-    );
-    const used = mine.filter((lr) => lr.status === "approved").reduce((s, lr) => s + lr.days, 0);
-    const pending = mine.filter((lr) => lr.status === "pending").reduce((s, lr) => s + lr.days, 0);
-    const entitled = LEAVE_ENTITLEMENTS[t];
+/** Pure balance arithmetic — unit-tested in tests/leave-balance.test.ts. */
+export function computeLeaveBalances(
+  balanceRows: { leave_type_id: string; entitled: number; carried_over: number }[],
+  requests: { leave_type_id: string; days: number; status: string }[]
+): LeaveBalance[] {
+  return (["annual", "sick", "casual"] as const).map((t) => {
+    const row = balanceRows.find((b) => b.leave_type_id === t);
+    const entitled = row?.entitled ?? 0;
+    const carried = Number(row?.carried_over ?? 0);
+    const mine = requests.filter((r) => r.leave_type_id === t);
+    const used = mine.filter((r) => r.status === "approved").reduce((s, r) => s + Number(r.days), 0);
+    const pending = mine.filter((r) => r.status === "pending").reduce((s, r) => s + Number(r.days), 0);
     return {
       type: t,
       entitled,
       used_approved: used,
       pending,
-      remaining: entitled - used,
+      remaining: entitled + carried - used,
     };
   });
+}
+
+/**
+ * Caller's own balance for a year: entitled (+ carry-over) from
+ * leave_balances minus APPROVED days from leave_requests. Pending leaves are
+ * NOT deducted (AT-04). No user parameter is ever taken from input.
+ */
+export async function getMyLeaveBalanceService(
+  db: SupabaseClient,
+  userId: string,
+  year?: number
+): Promise<MyLeaveBalanceResult> {
+  const y = year ?? todayInTimezone().year;
+
+  const [{ data: balanceRows, error: balErr }, { data: requests, error: reqErr }] = await Promise.all([
+    db
+      .from("leave_balances")
+      .select("leave_type_id, entitled, carried_over")
+      .eq("employee_id", userId)
+      .eq("year", y),
+    db
+      .from("leave_requests")
+      .select("leave_type_id, days, status, start_date")
+      .eq("employee_id", userId)
+      .gte("start_date", `${y}-01-01`)
+      .lte("start_date", `${y}-12-31`),
+  ]);
+  if (balErr) throw new Error(balErr.message);
+  if (reqErr) throw new Error(reqErr.message);
+
+  const balances = computeLeaveBalances(
+    (balanceRows ?? []) as { leave_type_id: string; entitled: number; carried_over: number }[],
+    (requests ?? []) as { leave_type_id: string; days: number; status: string }[]
+  );
   return { year: y, balances };
 }
 
@@ -356,19 +502,35 @@ export interface PayrollSummaryResult {
   note: string;
 }
 
-/** Aggregates only — never individual salaries (Art. III.6). */
-export function getPayrollSummaryService(
-  department?: DepartmentName,
+/**
+ * Aggregates only — never individual salaries (Art. III.6). Returns null
+ * when the caller cannot read compensations (RLS), e.g. managers.
+ */
+export async function getPayrollSummaryService(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string,
   period?: string
-): PayrollSummaryResult {
+): Promise<PayrollSummaryResult | null> {
+  if (scope.role !== "hr" && scope.role !== "admin") return null;
   const p = resolvePeriod(period);
-  const active = employeesInScope(department).filter((e) => e.status === "active");
-  const total = active.reduce((s, e) => s + e.salaryMonthlyPkr, 0);
+  const profiles = await profilesForDepartment(db, department);
+  const ids = profiles.map((p2) => p2.id);
+  if (ids.length === 0) {
+    return { period: p, headcount: 0, total: 0, average: 0, note: "No active employees in scope." };
+  }
+  const { data, error } = await db
+    .from("compensations")
+    .select("salary_monthly")
+    .in("employee_id", ids);
+  if (error) return null; // RLS denial or missing rows — no payroll figure
+  const salaries = (data ?? []).map((c) => Number(c.salary_monthly));
+  const total = salaries.reduce((s, v) => s + v, 0);
   return {
     period: p,
-    headcount: active.length,
+    headcount: salaries.length,
     total,
-    average: active.length ? Math.round(total / active.length) : 0,
+    average: salaries.length ? Math.round(total / salaries.length) : 0,
     note: "Aggregated monthly gross payroll in PKR for active employees; individual salaries are never disclosed.",
   };
 }
@@ -380,114 +542,136 @@ export interface EmployeeMatch {
   designation: string;
 }
 
-export interface OnLeaveTodayRow {
-  employee_id: string;
-  name: string;
-  department: string;
-  type: string;
-  start: string;
-  end: string;
-  days: number;
-}
-
-/**
- * Names of people on APPROVED leave today (start <= today <= end).
- * Directory-level information (who is away), not an individual's leave
- * record — safe for every role; individual salary/PII is never included.
- */
-export function getOnLeaveTodayService(): { date: string; rows: OnLeaveTodayRow[] } {
-  const today = todayIso();
-  const rows: OnLeaveTodayRow[] = [];
-  for (const lr of LEAVE_REQUESTS) {
-    if (lr.status !== "approved") continue;
-    if (lr.start > today || lr.end < today) continue;
-    const employee = EMPLOYEES.find((e) => e.id === lr.employeeId);
-    if (!employee || employee.status !== "active") continue;
-    rows.push({
-      employee_id: employee.id,
-      name: employee.name,
-      department: employee.department,
-      type: lr.type,
-      start: lr.start,
-      end: lr.end,
-      days: lr.days,
-    });
-  }
-  rows.sort((a, b) => a.department.localeCompare(b.department) || a.name.localeCompare(b.name));
-  return { date: today, rows };
-}
-
-export interface PendingLeaveRow {
-  request_id: string;
-  employee_id: string;
-  employee_name: string;
-  department: string;
-  type: LeaveType;
-  start: string;
-  end: string;
-  days: number;
-  reason: string;
-  applied_on: string;
-}
-
-/** All currently PENDING leave requests, oldest application first. */
-export function getPendingLeaveRequestsService(): {
-  date: string;
-  rows: PendingLeaveRow[];
-} {
-  const rows: PendingLeaveRow[] = [];
-  for (const lr of LEAVE_REQUESTS) {
-    if (lr.status !== "pending") continue;
-    const employee = EMPLOYEES.find((e) => e.id === lr.employeeId);
-    rows.push({
-      request_id: lr.id,
-      employee_id: lr.employeeId,
-      employee_name: employee?.name ?? lr.employeeId,
-      department: employee?.department ?? "",
-      type: lr.type,
-      start: lr.start,
-      end: lr.end,
-      days: lr.days,
-      reason: lr.reason,
-      applied_on: lr.appliedOn,
-    });
-  }
-  rows.sort((a, b) => a.applied_on.localeCompare(b.applied_on));
-  return { date: todayIso(), rows };
-}
-
 export interface SearchEmployeesResult {
   query: string;
   matches: EmployeeMatch[];
   total: number;
 }
 
-/**
- * Directory search. NEVER returns salary, CNIC or bank details
- * (Art. III.5, 6.2) — for any role.
- */
-export function searchEmployeesService(
+/** Directory search. NEVER returns salary, CNIC or bank details (Art. III.5). */
+export async function searchEmployeesService(
+  db: SupabaseClient,
   query: string,
-  department?: DepartmentName,
+  department?: string,
   limit = 10
-): SearchEmployeesResult {
+): Promise<SearchEmployeesResult> {
   const cap = Math.min(Math.max(limit, 1), 10);
-  const q = query.trim().toLowerCase();
-  const filtered = employeesInScope(department).filter(
-    (e) =>
-      e.name.toLowerCase().includes(q) ||
-      e.designation.toLowerCase().includes(q) ||
-      e.department.toLowerCase().includes(q)
+  const q = query.trim();
+  let builder = db
+    .from("profiles")
+    .select("id, full_name, department, designation")
+    .eq("status", "active")
+    .limit(cap);
+  if (department) builder = builder.eq("department", department);
+  const { data, error } = await builder.or(
+    `full_name.ilike.%${q}%,designation.ilike.%${q}%,department.ilike.%${q}%`
   );
+  if (error) throw new Error(error.message);
+  const matches = (data ?? []).map((p) => ({
+    id: p.id,
+    name: p.full_name,
+    department: p.department,
+    designation: p.designation ?? "",
+  }));
+  return { query, total: matches.length, matches };
+}
+
+export interface OnLeaveTodayRow {
+  full_name: string;
+  department: string;
+  leave_type: string;
+  start_date: string;
+  end_date: string;
+}
+
+export async function getOnLeaveTodayService(
+  db: SupabaseClient
+): Promise<{ date: string; rows: OnLeaveTodayRow[] }> {
+  const { data, error } = await db.rpc("on_leave_today");
+  if (error) throw new Error(error.message);
+  return { date: todayIso(), rows: (data ?? []) as OnLeaveTodayRow[] };
+}
+
+export interface PendingLeaveRow {
+  id: string;
+  employee_id: string;
+  employee_name: string;
+  department: string;
+  leave_type_id: "annual" | "sick" | "casual";
+  start_date: string;
+  end_date: string;
+  days: number;
+  reason: string;
+  applied_at: string;
+}
+
+/** Approval queue — RLS scopes it (manager: direct reports; HR/Admin: all). */
+export async function getPendingLeaveRequestsService(
+  db: SupabaseClient
+): Promise<{ date: string; rows: PendingLeaveRow[] }> {
+  const { data, error } = await db
+    .from("leave_requests")
+    .select(
+      "id, employee_id, leave_type_id, start_date, end_date, days, reason, applied_at, profiles!leave_requests_employee_id_fkey(full_name, department)"
+    )
+    .eq("status", "pending")
+    .order("applied_at", { ascending: true });
+  if (error) throw new Error(error.message);
+  const rows: PendingLeaveRow[] = (data ?? []).map((r: Record<string, unknown>) => {
+    const profile = r.profiles as { full_name: string; department: string } | null;
+    return {
+      id: String(r.id),
+      employee_id: String(r.employee_id),
+      employee_name: profile?.full_name ?? String(r.employee_id),
+      department: profile?.department ?? "",
+      leave_type_id: r.leave_type_id as PendingLeaveRow["leave_type_id"],
+      start_date: String(r.start_date),
+      end_date: String(r.end_date),
+      days: Number(r.days),
+      reason: String(r.reason),
+      applied_at: String(r.applied_at),
+    };
+  });
+  return { date: todayIso(), rows };
+}
+
+/** Public holidays in an inclusive range (used by every date validation). */
+export async function getHolidaysBetween(
+  db: SupabaseClient,
+  start: string,
+  end: string
+): Promise<Map<string, string>> {
+  const { data, error } = await db
+    .from("holidays")
+    .select("date, name")
+    .gte("date", start)
+    .lte("date", end);
+  if (error) throw new Error(error.message);
+  return new Map((data ?? []).map((h) => [h.date, h.name]));
+}
+
+export interface TeamOverlapResult {
+  teamSize: number;
+  offCount: number;
+  offNames: { name: string; type: string; start: string; end: string }[];
+}
+
+export async function getTeamOverlapService(
+  db: SupabaseClient,
+  start: string,
+  end: string
+): Promise<TeamOverlapResult> {
+  const { data, error } = await db.rpc("team_overlap", { p_start: start, p_end: end });
+  if (error) throw new Error(error.message);
+  const row = (Array.isArray(data) ? data[0] : data) as {
+    team_size: number;
+    off_count: number;
+    off_names: { name: string; type: string; start: string; end: string }[];
+  } | null;
   return {
-    query,
-    total: filtered.length,
-    matches: filtered.slice(0, cap).map((e) => ({
-      id: e.id,
-      name: e.name,
-      department: e.department,
-      designation: e.designation,
-    })),
+    teamSize: row?.team_size ?? 0,
+    offCount: row?.off_count ?? 0,
+    offNames: row?.off_names ?? [],
   };
 }
 
@@ -499,8 +683,9 @@ export interface DashboardKpis {
   filters: { department: string; period: string };
   as_of_date: string;
   timezone: string;
+  scope_note: string;
   headcount_active: number;
-  headcount_by_department: Record<DepartmentName, number>;
+  headcount_by_department: Record<string, number>;
   today: {
     date: string;
     present: number;
@@ -528,40 +713,83 @@ export interface DashboardKpis {
     headcount: number;
     total: number;
     average: number;
-  };
+  } | null;
 }
 
-export function getDashboardKpis(department?: DepartmentName): DashboardKpis {
-  const monthPeriod = resolvePeriod("this_month");
+const NO_ID = "00000000-0000-0000-0000-000000000000";
 
-  // "Today" = the latest working day that has attendance records, so weekend
-  // visits still show a meaningful snapshot. Echoed in the response.
-  const latestDate = ATTENDANCE_RECORDS.reduce((max, r) => (r.date > max ? r.date : max), "");
-  const todayRecords = ATTENDANCE_RECORDS.filter((r) => r.date === latestDate && (!department || employeesInScope(department).some((e) => e.id === r.employeeId)));
+export async function getDashboardKpis(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string
+): Promise<DashboardKpis> {
+  const monthPeriod = resolvePeriod("this_month");
+  const ids = await resolveScopeIds(db, scope);
+  const idFilter = ids && ids.length === 0 ? [NO_ID] : ids;
+
+  // "Today" = the latest working day that has attendance records.
+  let latestQuery = db.from("attendance").select("date").order("date", { ascending: false }).limit(1);
+  if (idFilter) latestQuery = latestQuery.in("employee_id", idFilter);
+  const { data: latest } = await latestQuery;
+  const latestDate = latest?.[0]?.date ?? todayIso();
+
+  let todayQuery = db.from("attendance").select("*").eq("date", latestDate);
+  if (idFilter) todayQuery = todayQuery.in("employee_id", idFilter);
+  const { data: todayRows } = await todayQuery;
   let present = 0, late = 0, absent = 0, onLeave = 0;
-  for (const r of todayRecords) {
+  for (const r of (todayRows ?? []) as AttendanceRow[]) {
     if (r.status === "present") present++;
     else if (r.status === "late") late++;
     else if (r.status === "absent") absent++;
     else onLeave++;
   }
 
-  const headcountByDept = {} as Record<DepartmentName, number>;
-  for (const d of DEPARTMENTS) {
-    headcountByDept[d] = EMPLOYEES.filter((e) => e.department === d && e.status === "active").length;
+  const scopedDept = scope.role === "manager" || scope.role === "employee" ? undefined : department;
+  const headcount = await getHeadcountService(db, scope, scopedDept, "active");
+
+  const headcountByDepartment: Record<string, number> = {};
+  if (scope.role === "admin" || scope.role === "hr") {
+    const { data: rows } = await db
+      .from("profiles")
+      .select("department")
+      .eq("status", "active");
+    for (const row of rows ?? []) {
+      headcountByDepartment[row.department] = (headcountByDepartment[row.department] ?? 0) + 1;
+    }
+  } else {
+    const idsInScope = ids ?? [];
+    if (idsInScope.length > 0) {
+      const { data: rows } = await db
+        .from("profiles")
+        .select("id, department")
+        .in("id", idsInScope);
+      for (const row of rows ?? []) {
+        headcountByDepartment[row.department] = (headcountByDepartment[row.department] ?? 0) + 1;
+      }
+    }
   }
 
-  const attendance = getAttendanceSummaryService(department, "this_month");
-  const latecomers = getLateComersService(department, "this_month", 3);
-  const leaveSummary = getLeaveSummaryService(department, "this_month");
-  const payroll = getPayrollSummaryService(department, "this_month");
+  const attendance = await getAttendanceSummaryService(db, scope, scopedDept, "this_month");
+  const latecomers = await getLateComersService(db, scope, scopedDept, "this_month", 3);
+  const leaveSummary = await getLeaveSummaryService(db, scope, scopedDept, "this_month");
+  const payroll = await getPayrollSummaryService(db, scope, scopedDept, "this_month");
+
+  const scopeNote =
+    scope.role === "employee"
+      ? "your own records"
+      : scope.role === "manager"
+        ? "your own records plus your direct reports"
+        : department
+          ? `the ${department} department`
+          : "all departments";
 
   return {
     filters: { department: department ?? "All departments", period: monthPeriod.key },
     as_of_date: todayIso(),
     timezone: TIMEZONE,
-    headcount_active: getHeadcountService(department, "active").count,
-    headcount_by_department: headcountByDept,
+    scope_note: scopeNote,
+    headcount_active: headcount.count,
+    headcount_by_department: headcountByDepartment,
     today: { date: latestDate, present, late, absent, on_leave: onLeave },
     attendance_this_month: {
       label: attendance.period.label,
@@ -584,49 +812,76 @@ export function getDashboardKpis(department?: DepartmentName): DashboardKpis {
         leaveSummary.by_type_and_status.sick.pending.requests +
         leaveSummary.by_type_and_status.casual.pending.requests,
     },
-    payroll: {
-      label: payroll.period.label,
-      headcount: payroll.headcount,
-      total: payroll.total,
-      average: payroll.average,
-    },
+    payroll: payroll
+      ? {
+          label: payroll.period.label,
+          headcount: payroll.headcount,
+          total: payroll.total,
+          average: payroll.average,
+        }
+      : null,
   };
 }
 
-/** Employee's own dashboard snapshot (no org-wide data). */
-export function getMySnapshotService(userId: string) {
-  const balances = getMyLeaveBalanceService(userId);
-  const latestDate = ATTENDANCE_RECORDS.reduce((max, r) => (r.date > max ? r.date : max), "");
-  const todayRecord = ATTENDANCE_RECORDS.find(
-    (r) => r.employeeId === userId && r.date === latestDate
-  );
-  const myRequests = LEAVE_REQUESTS.filter((lr) => lr.employeeId === userId).sort((a, b) =>
-    b.start.localeCompare(a.start)
-  );
-  const myLateCount = ATTENDANCE_RECORDS.filter(
-    (r) => r.employeeId === userId && r.status === "late" && r.date >= resolvePeriod("this_month").start
-  ).length;
+/** Employee/Manager own dashboard snapshot (no org-wide data). */
+export async function getMySnapshotService(db: SupabaseClient, userId: string) {
+  const balances = await getMyLeaveBalanceService(db, userId);
+  const { data: latest } = await db
+    .from("attendance")
+    .select("date")
+    .eq("employee_id", userId)
+    .order("date", { ascending: false })
+    .limit(1);
+  const latestDate = latest?.[0]?.date ?? "";
+  const { data: todayRecord } = await db
+    .from("attendance")
+    .select("status, check_in")
+    .eq("employee_id", userId)
+    .eq("date", latestDate)
+    .maybeSingle();
+
+  const { data: myRequests } = await db
+    .from("leave_requests")
+    .select("id, leave_type_id, start_date, end_date, days, status, reason, attachment_path")
+    .eq("employee_id", userId)
+    .order("start_date", { ascending: false });
+
+  const monthStart = resolvePeriod("this_month").start;
+  const { count: lateCount } = await db
+    .from("attendance")
+    .select("id", { count: "exact", head: true })
+    .eq("employee_id", userId)
+    .eq("status", "late")
+    .gte("date", monthStart);
+
   return {
     as_of_date: todayIso(),
     latest_working_day: latestDate,
     today_status: todayRecord?.status ?? "no_record",
-    today_check_in: todayRecord?.checkIn ?? null,
-    late_days_this_month: myLateCount,
+    today_check_in: todayRecord?.check_in
+      ? new Date(todayRecord.check_in).toLocaleTimeString("en-GB", {
+          timeZone: TIMEZONE,
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : null,
+    late_days_this_month: lateCount ?? 0,
     leave_balance: balances,
-    my_requests: myRequests.map((r) => ({
+    my_requests: (myRequests ?? []).map((r) => ({
       id: r.id,
-      type: r.type,
-      start: r.start,
-      end: r.end,
-      days: r.days,
+      type: r.leave_type_id,
+      start: r.start_date,
+      end: r.end_date,
+      days: Number(r.days),
       status: r.status,
       reason: r.reason,
+      attachment_path: r.attachment_path,
     })),
   };
 }
 
 // ---------------------------------------------------------------------------
-// HR operations — per-employee attendance report (Admin/HR only surfaces)
+// HR operations — per-employee attendance report (HR/Admin/Manager surfaces)
 // ---------------------------------------------------------------------------
 
 export interface EmployeeAttendanceRow {
@@ -647,42 +902,50 @@ export interface AttendanceReportResult {
   rows: EmployeeAttendanceRow[];
 }
 
-/**
- * Per-employee attendance breakdown for a period (active staff only).
- * Shares the same records and rate definition as every other metric, so the
- * report always reconciles with the dashboard and the AI tools.
- */
-export function getEmployeeAttendanceReport(
-  department?: DepartmentName,
+export async function getEmployeeAttendanceReport(
+  db: SupabaseClient,
+  scope: Scope,
+  department?: string,
   period?: string
-): AttendanceReportResult {
+): Promise<AttendanceReportResult> {
   const p = resolvePeriod(period);
-  const rows: EmployeeAttendanceRow[] = employeesInScope(department)
-    .filter((e) => e.status === "active")
-    .map((e) => {
-      let present = 0, late = 0, absent = 0, onLeave = 0;
-      for (const r of ATTENDANCE_RECORDS) {
-        if (r.employeeId !== e.id || r.date < p.start || r.date > p.end) continue;
-        if (r.status === "present") present++;
-        else if (r.status === "late") late++;
-        else if (r.status === "absent") absent++;
-        else onLeave++;
-      }
-      const attended = present + late;
-      const denominator = attended + absent;
-      return {
-        employee_id: e.id,
-        name: e.name,
-        department: e.department,
-        designation: e.designation,
-        present,
-        late,
-        absent,
-        on_leave: onLeave,
-        attendance_rate:
-          denominator > 0 ? Math.round((attended / denominator) * 1000) / 10 : 100,
-      };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const ids = await resolveScopeIds(db, scope);
+  let profileQuery = db.from("profiles").select("*").eq("status", "active");
+  if (department) profileQuery = profileQuery.eq("department", department);
+  if (ids) profileQuery = profileQuery.in("id", ids.length ? ids : [NO_ID]);
+  const { data: profiles, error } = await profileQuery;
+  if (error) throw new Error(error.message);
+
+  const rows: EmployeeAttendanceRow[] = [];
+  for (const e of (profiles ?? []) as ProfileRow[]) {
+    const { data: recs } = await db
+      .from("attendance")
+      .select("status")
+      .eq("employee_id", e.id)
+      .gte("date", p.start)
+      .lte("date", p.end);
+    let present = 0, late = 0, absent = 0, onLeave = 0;
+    for (const r of recs ?? []) {
+      if (r.status === "present") present++;
+      else if (r.status === "late") late++;
+      else if (r.status === "absent") absent++;
+      else onLeave++;
+    }
+    const attended = present + late;
+    const denominator = attended + absent;
+    rows.push({
+      employee_id: e.id,
+      name: e.full_name,
+      department: e.department,
+      designation: e.designation ?? "",
+      present,
+      late,
+      absent,
+      on_leave: onLeave,
+      attendance_rate:
+        denominator > 0 ? Math.round((attended / denominator) * 1000) / 10 : 100,
+    });
+  }
+  rows.sort((a, b) => a.name.localeCompare(b.name));
   return { period: p, definition: ATTENDANCE_RATE_DEFINITION, rows };
 }

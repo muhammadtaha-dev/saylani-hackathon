@@ -8,17 +8,18 @@ import type { Role } from "./types";
 interface ManagedUser {
   id: string;
   name: string;
-  email: string;
+  email: string | null;
   role: Role | "admin";
   department: string;
   designation: string;
   status: string;
-  hasPassword: boolean;
+  manager_id: string | null;
 }
 
 const ROLE_BADGE: Record<string, string> = {
   admin: "bg-purple-100 text-purple-700",
   hr: "bg-sky-100 text-sky-700",
+  manager: "bg-amber-100 text-amber-700",
   employee: "bg-emerald-100 text-emerald-700",
 };
 
@@ -36,9 +37,10 @@ export function TeamManagement({ role, selfId }: { role: Role; selfId: string })
     name: "",
     email: "",
     password: "",
-    role: "employee" as "employee" | "hr",
+    role: "employee" as "employee" | "manager" | "hr",
     department: "Engineering",
     designation: "",
+    manager_id: "",
   });
 
   const load = useCallback(async () => {
@@ -73,9 +75,11 @@ export function TeamManagement({ role, selfId }: { role: Role; selfId: string })
       }
       setNotice({
         tone: "success",
-        text: `${data.user?.name} added as ${data.user?.role === "hr" ? "HR Manager" : "Employee"} — they can sign in with the password you set.`,
+        text: `${data.user?.name} added as ${
+          data.user?.role === "hr" ? "HR Manager" : data.user?.role === "manager" ? "Manager" : "Employee"
+        } — they can sign in with the password you set.`,
       });
-      setForm((f) => ({ ...f, name: "", email: "", password: "", designation: "" }));
+      setForm((f) => ({ ...f, name: "", email: "", password: "", designation: "", manager_id: "" }));
       await load();
     } finally {
       setBusy(false);
@@ -100,8 +104,9 @@ export function TeamManagement({ role, selfId }: { role: Role; selfId: string })
   }
 
   const canRemove = (u: ManagedUser) =>
-    u.id !== selfId && u.role !== "admin" && (role === "admin" ? u.role === "hr" || u.role === "employee" : u.role === "employee");
-  const roleOptions = role === "admin" ? ["employee", "hr"] : ["employee"];
+    u.id !== selfId && u.role !== "admin" && (role === "admin" ? u.role === "hr" || u.role === "manager" || u.role === "employee" : u.role === "employee");
+  const roleOptions = role === "admin" ? ["employee", "manager", "hr"] : ["employee"];
+  const managers = (users ?? []).filter((u) => u.role === "manager" && u.status === "active");
 
   const inputClass =
     "h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100";
@@ -155,12 +160,12 @@ export function TeamManagement({ role, selfId }: { role: Role; selfId: string })
         />
         <select
           value={form.role}
-          onChange={(e) => setForm((f) => ({ ...f, role: e.target.value as "employee" | "hr" }))}
+          onChange={(e) => setForm((f) => ({ ...f, role: e.target.value as "employee" | "manager" | "hr" }))}
           aria-label="Role"
           className={inputClass}
         >
           {roleOptions.map((r) => (
-            <option key={r} value={r}>{r === "hr" ? "HR Manager" : "Employee"}</option>
+            <option key={r} value={r}>{r === "hr" ? "HR Manager" : r === "manager" ? "Manager" : "Employee"}</option>
           ))}
         </select>
         <select
@@ -180,6 +185,17 @@ export function TeamManagement({ role, selfId }: { role: Role; selfId: string })
           aria-label="Designation"
           className={inputClass}
         />
+        <select
+          value={form.manager_id}
+          onChange={(e) => setForm((f) => ({ ...f, manager_id: e.target.value }))}
+          aria-label="Manager (direct reports)"
+          className={inputClass}
+        >
+          <option value="">No manager assigned</option>
+          {managers.map((m) => (
+            <option key={m.id} value={m.id}>{m.name} — {m.department}</option>
+          ))}
+        </select>
       </div>
       <button
         type="button"
@@ -221,7 +237,11 @@ export function TeamManagement({ role, selfId }: { role: Role; selfId: string })
                   <span className={`text-xs font-medium ${u.status === "active" ? "text-emerald-600" : "text-rose-500"}`}>
                     {u.status}
                   </span>
-                  {!u.hasPassword && <span className="ml-1 text-[10px] text-slate-400">(no password)</span>}
+                  {u.manager_id && (
+                    <span className="ml-1 text-[10px] text-slate-400">
+                      → {(users ?? []).find((m) => m.id === u.manager_id)?.name ?? "manager"}
+                    </span>
+                  )}
                 </td>
                 <td className="py-2 text-right">
                   {canRemove(u) && u.status === "active" && (

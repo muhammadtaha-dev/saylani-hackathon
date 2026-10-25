@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { X, RefreshCw, ShieldCheck, ShieldX, Download } from "lucide-react";
 import type {
-  AiLogRowClient,
   AuditEventClient,
   ChainVerificationClient,
   Role,
@@ -15,14 +14,6 @@ const STATUS_STYLES: Record<string, string> = {
   error: "bg-rose-100 text-rose-700",
 };
 
-const OUTCOME_STYLES: Record<string, string> = {
-  answered: "bg-emerald-100 text-emerald-700",
-  refused: "bg-amber-100 text-amber-700",
-  fallback: "bg-slate-200 text-slate-600",
-  rate_limited: "bg-rose-100 text-rose-700",
-  timeout: "bg-rose-100 text-rose-700",
-  validation_failed: "bg-amber-100 text-amber-700",
-};
 
 const ACTION_STYLES: Record<string, string> = {
   login_success: "bg-emerald-100 text-emerald-700",
@@ -92,7 +83,7 @@ export function AuditModal({
   const [filters, setFilters] = useState({ user: "", action: "all", from: "", to: "" });
   const [verification, setVerification] = useState<ChainVerificationClient | null>(null);
   const [verifying, setVerifying] = useState(false);
-  const [aiLogs, setAiLogs] = useState<AiLogRowClient[] | null>(null);
+  const [aiCalls, setAiCalls] = useState<AuditEventClient[] | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -121,9 +112,13 @@ export function AuditModal({
 
   const loadAiLogs = useCallback(async () => {
     if (role !== "admin") return;
-    const res = await fetch("/api/ai/logs");
-    const data = (await res.json()) as { logs?: AiLogRowClient[] };
-    setAiLogs(data.logs ?? []);
+    try {
+      const res = await fetch("/api/audit?action=ai_call&limit=150");
+      const data = (await res.json()) as { events?: AuditEventClient[] };
+      setAiCalls(data.events ?? []);
+    } catch {
+      setAiCalls([]);
+    }
   }, [role]);
 
   const verify = useCallback(async () => {
@@ -363,60 +358,55 @@ export function AuditModal({
             </>
           )}
 
-          {/* AI call log (admin diagnostics, existing ai_logs) */}
+          {/* AI call log (admin diagnostics — audit_log rows with action = ai_call) */}
           {isPrivileged && tab === "ai" && role === "admin" && (
             <>
-              {!aiLogs && <p className="py-3 text-sm text-slate-400">Loading AI calls…</p>}
-              {aiLogs && aiLogs.length === 0 && (
+              {!aiCalls && <p className="py-3 text-sm text-slate-400">Loading AI calls…</p>}
+              {aiCalls && aiCalls.length === 0 && (
                 <p className="rounded-lg bg-slate-50 p-6 text-center text-sm text-slate-500">
                   No AI calls recorded yet. Use the assistant, the summary button or Smart Leave — every call lands here.
                 </p>
               )}
-              {aiLogs && aiLogs.length > 0 && (
+              {aiCalls && aiCalls.length > 0 && (
                 <table className="w-full border-collapse text-left text-xs">
                   <thead>
                     <tr className="border-b border-slate-200 text-[11px] uppercase tracking-wide text-slate-400">
                       <th className="px-2 py-2 font-medium">Time</th>
                       <th className="px-2 py-2 font-medium">User</th>
                       <th className="px-2 py-2 font-medium">Feature</th>
-                      <th className="px-2 py-2 font-medium">Tool</th>
-                      <th className="px-2 py-2 font-medium">Args (sanitised)</th>
+                      <th className="px-2 py-2 font-medium">Tool / target</th>
                       <th className="px-2 py-2 font-medium">Status</th>
-                      <th className="px-2 py-2 font-medium">Outcome</th>
                       <th className="px-2 py-2 font-medium">Latency</th>
-                      <th className="px-2 py-2 font-medium">Provider</th>
+                      <th className="px-2 py-2 font-medium">Error</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {aiLogs.map((log) => (
-                      <tr key={log.id} className="border-b border-slate-50 align-top text-slate-700">
-                        <td className="whitespace-nowrap px-2 py-2 font-mono text-[11px] text-slate-500">
-                          {new Date(log.created_at).toLocaleTimeString()}
-                        </td>
-                        <td className="px-2 py-2">{log.user_name}</td>
-                        <td className="px-2 py-2">{log.feature}</td>
-                        <td className="px-2 py-2 font-mono text-[11px]">{log.tool_name ?? "—"}</td>
-                        <td className="max-w-[220px] truncate px-2 py-2 font-mono text-[11px] text-slate-500" title={log.tool_args ? JSON.stringify(log.tool_args) : ""}>
-                          {log.tool_args ? JSON.stringify(log.tool_args) : "—"}
-                        </td>
-                        <td className="px-2 py-2">
-                          {log.tool_status ? (
-                            <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[log.tool_status] ?? "bg-slate-100 text-slate-600"}`}>
-                              {log.tool_status}
+                    {aiCalls.map((log) => {
+                      const d = (log.details ?? {}) as Record<string, unknown>;
+                      return (
+                        <tr key={log.id} className="border-b border-slate-50 align-top text-slate-700">
+                          <td className="whitespace-nowrap px-2 py-2 font-mono text-[11px] text-slate-500">
+                            {new Date(log.ts).toLocaleTimeString()}
+                          </td>
+                          <td className="px-2 py-2">{log.actor_name}</td>
+                          <td className="px-2 py-2">{String(d.feature ?? "—")}</td>
+                          <td className="px-2 py-2 font-mono text-[11px]">
+                            {String(d.tool_name ?? log.target_id ?? "—")}
+                          </td>
+                          <td className="px-2 py-2">
+                            <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[String(d.tool_status ?? "ok")] ?? "bg-slate-100 text-slate-600"}`}>
+                              {String(d.tool_status ?? d.outcome ?? "ok")}
                             </span>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                        <td className="px-2 py-2">
-                          <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${OUTCOME_STYLES[log.outcome] ?? "bg-slate-100 text-slate-600"}`}>
-                            {log.outcome}
-                          </span>
-                        </td>
-                        <td className="whitespace-nowrap px-2 py-2 font-mono text-[11px]">{log.latency_ms} ms</td>
-                        <td className="px-2 py-2">{log.provider}</td>
-                      </tr>
-                    ))}
+                          </td>
+                          <td className="whitespace-nowrap px-2 py-2 font-mono text-[11px]">
+                            {d.latency_ms != null ? `${d.latency_ms} ms` : "—"}
+                          </td>
+                          <td className="px-2 py-2 font-mono text-[11px] text-slate-500">
+                            {d.error_code ? String(d.error_code) : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               )}

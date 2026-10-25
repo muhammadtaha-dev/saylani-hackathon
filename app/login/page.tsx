@@ -7,6 +7,7 @@ import { Building2, LogIn, ShieldCheck } from "lucide-react";
 const DEMO_ACCOUNTS = [
   { email: "admin@saylani.com", password: "Admin@123", role: "Admin", name: "Ayesha Siddiqui" },
   { email: "hr@saylani.com", password: "HR@123", role: "HR Manager", name: "Saima Yusuf" },
+  { email: "bilal.ahmed@saylani.com", password: "Manager@123", role: "Manager (Engineering)", name: "Bilal Ahmed" },
   { email: "taha@saylani.com", password: "Taha@123", role: "Employee", name: "Muhammad Taha" },
 ];
 

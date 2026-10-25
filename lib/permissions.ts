@@ -2,12 +2,15 @@
  * HCM Lite — permission layer (Art. III.3, Art. I.4).
  *
  * ONE permission system: the same matrix guards the REST API and every AI
- * tool call. A denied call returns a structured `forbidden` result and the
- * model turns it into a polite refusal — the refusal is identical whether or
- * not the protected record exists (CHAT-07).
+ * tool call. Roles: employee | manager | hr | admin.
+ *   - Employee: own rows only.
+ *   - Manager:  direct reports (Row Level Security scopes the data; this
+ *               matrix decides which tools/questions are even attempted).
+ *   - HR/Admin: everything.
+ * A denied call returns a structured `forbidden` result, is appended to the
+ * audit trail, and the model turns it into a polite refusal — the refusal is
+ * identical whether or not the protected record exists (CHAT-07).
  */
-
-import type { LeaveType, Role } from "./hcmData";
 
 export const TOOL_NAMES = [
   "get_headcount",
@@ -25,19 +28,23 @@ export type ToolName = (typeof TOOL_NAMES)[number];
 
 export type FeatureName = "chat" | "summary" | "smart_leave" | "policy" | "logs" | "dashboard";
 
+export type Role = "employee" | "manager" | "hr" | "admin";
+
 const TOOL_MATRIX: Record<ToolName, Record<Role, boolean>> = {
-  get_headcount: { admin: true, hr: true, employee: false },
-  get_attendance_summary: { admin: true, hr: true, employee: true }, // employee => own record only
-  get_late_comers: { admin: true, hr: true, employee: false },
-  get_leave_summary: { admin: true, hr: true, employee: false },
-  get_my_leave_balance: { admin: true, hr: true, employee: true }, // own, no user parameter
-  get_payroll_summary: { admin: true, hr: true, employee: false },
-  search_employees: { admin: true, hr: true, employee: true }, // safe fields only
+  // Manager sees org aggregates but RLS narrows every query to own + direct
+  // reports, so a manager's "attendance this month" is their team's.
+  get_headcount: { admin: true, hr: true, manager: true, employee: false },
+  get_attendance_summary: { admin: true, hr: true, manager: true, employee: true }, // employee => own record only
+  get_late_comers: { admin: true, hr: true, manager: true, employee: false },
+  get_leave_summary: { admin: true, hr: true, manager: true, employee: false },
+  get_my_leave_balance: { admin: true, hr: true, manager: true, employee: true }, // own, no user parameter
+  get_payroll_summary: { admin: true, hr: true, manager: false, employee: false },
+  search_employees: { admin: true, hr: true, manager: true, employee: true }, // safe fields only
   // Directory-level "who is away" — names and dates only, no personal details.
-  get_on_leave_today: { admin: true, hr: true, employee: true },
-  // The approval queue is an HR/Admin surface; employees are refused and the
-  // denial is audit-logged.
-  get_pending_leave_requests: { admin: true, hr: true, employee: false },
+  get_on_leave_today: { admin: true, hr: true, manager: true, employee: true },
+  // The approval queue is an HR/Admin/Manager surface; employees are refused
+  // and the denial is audit-logged.
+  get_pending_leave_requests: { admin: true, hr: true, manager: true, employee: false },
 };
 
 export interface SessionIdentity {
@@ -50,7 +57,7 @@ export interface SessionIdentity {
 export interface PermissionDecision {
   allowed: boolean;
   /** Restriction applied to the call, e.g. employee attendance is scoped to own records. */
-  restriction?: "own_record_only";
+  restriction?: "own_record_only" | "team_scope";
   reason?: string;
 }
 
@@ -69,6 +76,11 @@ export function checkToolPermission(
   if (role === "employee" && tool === "get_attendance_summary") {
     return { allowed: true, restriction: "own_record_only" };
   }
+  if (role === "manager") {
+    // Every manager query is narrowed to own + direct reports by RLS; the
+    // service layer also applies the scope filter explicitly.
+    return { allowed: true, restriction: "team_scope" };
+  }
   return { allowed: true };
 }
 
@@ -82,13 +94,21 @@ export function checkFeaturePermission(
     case "policy":
       return true;
     case "summary":
+      // Managers get the AI summary; RLS scopes its numbers to their team.
+      return role === "admin" || role === "hr" || role === "manager";
     case "logs":
+      // The full audit trail view stays HR/Admin (E.23); others see their own
+      // entries via the audit API's RLS scoping.
       return role === "admin" || role === "hr";
     case "smart_leave":
-      return role === "employee";
+      return role === "employee" || role === "manager";
     case "dashboard":
       return true; // KPI shape is filtered per role inside the dashboard route
   }
+}
+
+export function canDecideLeave(role: Role): boolean {
+  return role === "admin" || role === "hr" || role === "manager";
 }
 
 // ---------------------------------------------------------------------------
@@ -147,17 +167,19 @@ export function guardRequest(text: string): GuardResult {
 }
 
 /** Allowed leave types for argument validation. */
-export function isLeaveType(value: string): value is LeaveType {
+export function isLeaveType(value: string): value is "annual" | "sick" | "casual" {
   return ["annual", "sick", "casual"].includes(value);
 }
 
 // ---------------------------------------------------------------------------
-// User management permissions: Admin manages HR + Employees; HR manages
-// Employees only. Nobody manages Admins through this surface.
+// User management permissions: Admin manages HR/Manager/Employee; HR manages
+// Employees. Managers do not manage accounts through this surface.
 // ---------------------------------------------------------------------------
 
 export function canManageUser(actor: Role, targetRole: Role): boolean {
-  if (actor === "admin") return targetRole === "hr" || targetRole === "employee";
+  if (actor === "admin") {
+    return targetRole === "hr" || targetRole === "manager" || targetRole === "employee";
+  }
   if (actor === "hr") return targetRole === "employee";
   return false;
 }

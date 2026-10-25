@@ -1,6 +1,6 @@
 /** Shared client-side types mirroring the API contracts (Spec §7). */
 
-export type Role = "admin" | "hr" | "employee";
+export type Role = "employee" | "manager" | "hr" | "admin";
 
 export interface SessionInfo {
   userId: string;
@@ -12,16 +12,19 @@ export interface SessionInfo {
 export interface PublicUser {
   id: string;
   name: string;
-  email: string;
+  email: string | null;
   role: string;
   department: string;
   designation: string;
+  status: string;
+  manager_id: string | null;
 }
 
 export interface DashboardKpis {
   filters: { department: string; period: string };
   as_of_date: string;
   timezone: string;
+  scope_note: string;
   headcount_active: number;
   headcount_by_department: Record<string, number>;
   today: { date: string; present: number; late: number; absent: number; on_leave: number };
@@ -36,7 +39,7 @@ export interface DashboardKpis {
   };
   latecomers_top: { name: string; late_count: number }[];
   leave_this_month: { label: string; approved_requests: number; pending_requests: number };
-  payroll: { label: string; headcount: number; total: number; average: number };
+  payroll: { label: string; headcount: number; total: number; average: number } | null;
 }
 
 export interface MySnapshot {
@@ -57,6 +60,7 @@ export interface MySnapshot {
     days: number;
     status: string;
     reason: string;
+    attachment_path: string | null;
   }[];
 }
 
@@ -74,6 +78,14 @@ export interface ChatMessage {
   failed?: boolean;
   /** The user text that produced this assistant message (for Retry). */
   retryOf?: string;
+}
+
+export interface ChatHistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+  tools_used: string[] | null;
+  refused: boolean;
+  created_at: string;
 }
 
 export interface AuditEventClient {
@@ -102,25 +114,6 @@ export interface ChainVerificationClient {
   reason?: string;
 }
 
-export interface AiLogRowClient {
-  id: string;
-  created_at: string;
-  user_id: string;
-  user_name: string;
-  role: string;
-  feature: string;
-  tool_name: string | null;
-  tool_args: Record<string, unknown> | null;
-  tool_status: string | null;
-  outcome: string;
-  latency_ms: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  policy_version: string;
-  provider: string;
-  error_code: string | null;
-}
-
 export interface LeaveSuggestionClient {
   type: string;
   start: string;
@@ -132,11 +125,13 @@ export interface LeaveSuggestionClient {
 export const ROLE_LABELS: Record<Role, string> = {
   admin: "Admin",
   hr: "HR Manager",
+  manager: "Manager",
   employee: "Employee",
 };
 
 export const ROLE_BADGE_CLASSES: Record<Role, string> = {
   admin: "bg-purple-100 text-purple-700 ring-purple-200",
   hr: "bg-sky-100 text-sky-700 ring-sky-200",
+  manager: "bg-amber-100 text-amber-700 ring-amber-200",
   employee: "bg-emerald-100 text-emerald-700 ring-emerald-200",
 };

@@ -1,10 +1,12 @@
 /**
  * POST /api/ai/chat — the assistant chat endpoint (Spec 7.1).
  *
- * Lifecycle: session identity (server-side) -> input limits -> per-user rate
- * limit -> pre-model permission guard -> [provider tool-calling loop, max 3
- * rounds, 15s timeout] OR grounded mock -> answer with ai_generated label ->
- * ai_logs row. The browser never talks to the AI provider (AT-11).
+ * Lifecycle: session identity (server-side Supabase Auth) -> input limits ->
+ * per-user rate limit -> pre-model permission guard -> [provider tool-calling
+ * loop, max 3 rounds, 15s timeout] OR grounded mock -> answer with the
+ * ai_generated label -> chat_messages rows (per user, DB-backed history) ->
+ * audit trail row. Tool calls execute with the caller's JWT so RLS applies;
+ * the browser never talks to the AI provider (AT-11).
  */
 
 import { randomUUID } from "crypto";
@@ -18,8 +20,7 @@ import {
   usageOf,
   AiTimeoutError,
 } from "@/lib/gemini";
-import { appendAiLog, type AiOutcome } from "@/lib/aiLogs";
-import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
+import { appendAuditEvent, appendAuditEventAsync, ipFromRequest } from "@/lib/audit";
 import {
   checkFeaturePermission,
   guardRequest,
@@ -33,23 +34,13 @@ import {
 } from "@/lib/prompt";
 import { checkRateLimit, RATE_LIMIT } from "@/lib/rateLimit";
 import { runMockAssistant, guardRefusalMessage } from "@/lib/mockAssistant";
-import { getSession } from "@/lib/session";
+import { requireSession } from "@/lib/session";
+import { supabaseServer, supabaseConfigured } from "@/lib/supabase/server";
 import { executeTool } from "@/lib/tools";
 
 const MAX_MESSAGE_LENGTH = 1000;
 const MAX_TOOL_ROUNDS = 3;
 const HISTORY_WINDOW = 8; // messages of stored context per conversation
-
-interface StoredMessage {
-  role: "user" | "model";
-  text: string;
-}
-/**
- * Conversation memory, keyed by USER and conversation id — never by the
- * client-supplied conversation id alone (a shared id must not leak another
- * user's history into someone else's model context).
- */
-const conversations = new Map<string, StoredMessage[]>();
 
 const FALLBACK_TIMEOUT =
   "The assistant took too long to respond. Please try again in a moment.";
@@ -58,11 +49,14 @@ const FALLBACK_PROVIDER =
 const FALLBACK_ROUNDS = TOOL_ROUNDS_FALLBACK;
 
 export async function POST(request: Request) {
-  const started = Date.now();
-  const session = await getSession();
-  if (!session) {
-    return Response.json({ error: "Not signed in." }, { status: 401 });
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
   }
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  const session: SessionIdentity = auth.session;
+  const supabase = await supabaseServer();
+  const started = Date.now();
 
   const body = (await request.json().catch(() => null)) as
     | { message?: unknown; conversation_id?: unknown }
@@ -76,17 +70,32 @@ export async function POST(request: Request) {
   }
 
   const now = currentMoment();
-  const featureBase = "chat" as const;
+  const conversationId =
+    typeof body?.conversation_id === "string" && body.conversation_id
+      ? body.conversation_id
+      : randomUUID();
+
+  const storeMessage = async (role: "user" | "assistant", content: string, toolsUsed: string[] = [], refused = false) => {
+    await supabase.from("chat_messages").insert({
+      user_id: session.userId,
+      conversation_id: conversationId,
+      role,
+      content,
+      tools_used: toolsUsed,
+      refused,
+    });
+  };
 
   // Rate limit (per user, server-side).
   const rate = checkRateLimit(session.userId);
   if (!rate.allowed) {
-    appendAiLog(session, {
-      feature: featureBase,
-      outcome: "rate_limited",
-      latency_ms: Date.now() - started,
-      provider: "none",
-      error_code: "rate_limited",
+    appendAuditEvent({
+      action: "ai_call",
+      actor: { userId: session.userId, name: session.name, role: session.role },
+      targetType: "ai_request",
+      targetId: "chat",
+      ip: ipFromRequest(request),
+      details: { feature: "chat", outcome: "rate_limited", error_code: "rate_limited" },
     });
     return Response.json(
       { error: `You've reached the limit of ${RATE_LIMIT} assistant requests per hour. Please try again later.` },
@@ -97,13 +106,7 @@ export async function POST(request: Request) {
   // Permission guard BEFORE the model sees anything (Art. III.6).
   const guard = guardRequest(message);
   if (guard.blocked) {
-    appendAiLog(session, {
-      feature: featureBase,
-      outcome: "refused",
-      latency_ms: Date.now() - started,
-      provider: "none",
-      error_code: `guard_${guard.kind}`,
-    });
+    const refusal = guardRefusalMessage(guard.kind ?? "sensitive_pii", message);
     appendAuditEvent({
       action: "ai_permission_denied",
       actor: { userId: session.userId, name: session.name, role: session.role },
@@ -112,20 +115,17 @@ export async function POST(request: Request) {
       ip: ipFromRequest(request),
       details: { feature: "chat", guard: guard.kind },
     });
+    await storeMessage("user", message);
+    await storeMessage("assistant", refusal, [], true);
     return Response.json({
-      answer: guardRefusalMessage(guard.kind ?? "sensitive_pii", message),
+      answer: refusal,
       ai_generated: true,
       refused: true,
       tools_used: [],
-      conversation_id: typeof body?.conversation_id === "string" ? body.conversation_id : randomUUID(),
+      conversation_id: conversationId,
       meta: { date: now.dateLabel, timezone: now.timezone, policy_version: POLICY_VERSION, provider: "guard" },
     });
   }
-
-  const conversationId =
-    typeof body?.conversation_id === "string" && body.conversation_id
-      ? body.conversation_id
-      : randomUUID();
 
   if (!checkFeaturePermission(session.role, "chat")) {
     return Response.json({ error: "Not allowed." }, { status: 403 });
@@ -133,27 +133,33 @@ export async function POST(request: Request) {
 
   let answer = "";
   let toolsUsed: string[] = [];
-  let outcome: AiOutcome = "answered";
   let provider: "gemini" | "mock" = "mock";
   let fallbackUsed = false;
   let promptTokens = 0;
   let completionTokens = 0;
-  let feature: "chat" | "policy" = "chat";
   let errorCode: string | null = null;
 
   try {
     if (!AI_ENABLED) {
-      const mock = await runMockAssistant(message, session);
+      const mock = await runMockAssistant(supabase, message, session);
       answer = mock.answer;
       toolsUsed = mock.toolsUsed;
-      feature = mock.feature === "policy" ? "policy" : "chat";
       provider = "mock";
-      if (mock.refused) outcome = "refused";
       completionTokens = Math.ceil(answer.length / 4);
     } else {
       provider = "gemini";
-      const memoryKey = `${session.userId}:${conversationId}`;
-      const history = (conversations.get(memoryKey) ?? []).slice(-HISTORY_WINDOW);
+      const { data: historyRows } = await supabase
+        .from("chat_messages")
+        .select("role, content")
+        .eq("user_id", session.userId)
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: false })
+        .limit(HISTORY_WINDOW);
+      const history = (historyRows ?? []).reverse().map((m) => ({
+        role: m.role as "user" | "model",
+        text: m.content as string,
+      }));
+
       const contents: Array<{
         role: "user" | "model";
         parts: Array<
@@ -179,12 +185,11 @@ export async function POST(request: Request) {
         }
         if (executed >= MAX_TOOL_ROUNDS) {
           answer = FALLBACK_ROUNDS;
-          outcome = "fallback";
           errorCode = "too_many_tool_rounds";
           break;
         }
 
-        const envelope = await executeTool(call.name, call.args, session, { feature: featureBase });
+        const envelope = await executeTool(supabase, call.name, call.args, session, { feature: "chat" });
         toolsUsed.push(call.name);
 
         contents.push({ role: "model", parts: modelPartsOf(result) as never });
@@ -204,42 +209,46 @@ export async function POST(request: Request) {
   } catch (err) {
     // Fail soft: on any provider failure, fall back to the grounded mock so
     // the user still receives a real, database-backed answer. The failure is
-    // logged server-side — silent fallbacks hide outages (Loop 1 audit).
+    // logged server-side — silent fallbacks hide outages.
     errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
-    outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
     console.error(`[hcm] AI provider failure for user ${session.userId}:`, err);
     try {
-      const mock = await runMockAssistant(message, session);
+      const mock = await runMockAssistant(supabase, message, session);
       answer = mock.answer;
       toolsUsed = mock.toolsUsed;
-      feature = mock.feature === "policy" ? "policy" : "chat";
       provider = "mock";
       fallbackUsed = true;
-      if (mock.refused) outcome = "refused";
     } catch {
       answer = err instanceof AiTimeoutError ? FALLBACK_TIMEOUT : FALLBACK_PROVIDER;
       provider = AI_ENABLED ? "gemini" : "mock";
     }
   }
 
-  // Conversation memory (windowed, server-side, per user).
-  const memoryKey = `${session.userId}:${conversationId}`;
-  const memory = conversations.get(memoryKey) ?? [];
-  memory.push({ role: "user", text: message });
-  memory.push({ role: "model", text: answer });
-  while (memory.length > HISTORY_WINDOW) memory.shift();
-  conversations.set(memoryKey, memory);
+  // Persist the conversation (per user, DB-backed history — Checklist C.11).
+  try {
+    await storeMessage("user", message);
+    await storeMessage("assistant", answer, toolsUsed);
+  } catch {
+    // history persistence is best-effort; the answer still returns
+  }
 
-  const identity: SessionIdentity = session;
-  appendAiLog(identity, {
-    feature,
-    outcome,
-    latency_ms: Date.now() - started,
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    provider,
-    error_code: errorCode,
+  appendAuditEvent({
+    action: "ai_call",
+    actor: { userId: session.userId, name: session.name, role: session.role },
+    targetType: "ai_request",
+    targetId: "chat",
+    ip: ipFromRequest(request),
+    details: {
+      feature: "chat",
+      outcome: "answered",
+      latency_ms: Date.now() - started,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      provider: fallbackUsed ? "mock (provider fallback)" : provider,
+      error_code: errorCode,
+    },
   });
+  void appendAuditEventAsync; // (kept for routes that need durable writes)
 
   return Response.json({
     answer,
@@ -251,7 +260,50 @@ export async function POST(request: Request) {
       date: now.dateLabel,
       timezone: now.timezone,
       policy_version: POLICY_VERSION,
-      provider: fallbackUsed ? "mock (provider fallback)" : AI_ENABLED ? "gemini" : "mock",
+      provider: fallbackUsed ? "mock (provider fallback)" : provider,
     },
   });
+}
+
+/** GET — chat history for the latest (or given) conversation, per user. */
+export async function GET(request: Request) {
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
+  }
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  const supabase = await supabaseServer();
+
+  const url = new URL(request.url);
+  const conversationId = url.searchParams.get("conversation_id");
+
+  if (conversationId) {
+    const { data } = await supabase
+      .from("chat_messages")
+      .select("role, content, tools_used, refused, created_at")
+      .eq("user_id", auth.session.userId)
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true })
+      .limit(100);
+    return Response.json({ conversation_id: conversationId, messages: data ?? [] });
+  }
+
+  // Latest conversation for this user.
+  const { data: latest } = await supabase
+    .from("chat_messages")
+    .select("conversation_id")
+    .eq("user_id", auth.session.userId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  const id = latest?.[0]?.conversation_id;
+  if (!id) return Response.json({ conversation_id: null, messages: [] });
+
+  const { data } = await supabase
+    .from("chat_messages")
+    .select("role, content, tools_used, refused, created_at")
+    .eq("user_id", auth.session.userId)
+    .eq("conversation_id", id)
+    .order("created_at", { ascending: true })
+    .limit(100);
+  return Response.json({ conversation_id: id, messages: data ?? [] });
 }

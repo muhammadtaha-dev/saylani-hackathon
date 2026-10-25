@@ -1,12 +1,16 @@
 /**
- * GET /api/session — current session identity (null when signed out).
- * The old demo "switch account" endpoint was removed: identity now comes
- * only from real authentication (POST /api/auth/login).
+ * GET /api/session — current session identity (null when signed out), plus
+ * whether the backend is configured at all so the UI can show a setup screen
+ * instead of a dead app.
  */
 
-import { getSession } from "@/lib/session";
+import { getCurrentSession } from "@/lib/session";
+import { supabaseConfigured } from "@/lib/supabase/server";
 
 export async function GET() {
-  const session = await getSession();
-  return Response.json({ session });
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, session: null });
+  }
+  const session = await getCurrentSession();
+  return Response.json({ configured: true, session });
 }

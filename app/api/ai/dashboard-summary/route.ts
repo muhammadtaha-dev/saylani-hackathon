@@ -1,20 +1,21 @@
 /**
  * POST /api/ai/dashboard-summary — 3–5 KPI insight bullets (Spec 7.2, SUM).
- * Admin/HR only (403 for employees). The server RECOMPUTES the KPI JSON from
- * the shared services rather than trusting the client payload, then applies
- * the post-generation number check: every number in every bullet must exist
- * in the KPI input or be a trivially derived percentage/difference (SUM-04).
- * Fewer than 3 grounded bullets after one regeneration => no summary (SUM-05).
+ * Admin/HR/Manager (403 otherwise). The server RECOMPUTES the KPI JSON via
+ * the shared services running with the caller's JWT (RLS scopes a manager's
+ * numbers to their team), then applies the post-generation number check:
+ * every number in every bullet must exist in the KPI input or be a trivially
+ * derived percentage/difference (SUM-04). Fewer than 3 grounded bullets after
+ * one regeneration => no summary (SUM-05).
  */
 
 import { AI_ENABLED, generateWithTimeout, getJsonModel, AiTimeoutError } from "@/lib/gemini";
-import { appendAiLog, type AiOutcome } from "@/lib/aiLogs";
+import { appendAuditEvent } from "@/lib/audit";
 import { checkFeaturePermission } from "@/lib/permissions";
 import { buildSummarySystemPrompt, buildSummaryUserPrompt, POLICY_VERSION } from "@/lib/prompt";
 import { checkRateLimit, RATE_LIMIT } from "@/lib/rateLimit";
-import { getSession } from "@/lib/session";
+import { requireSession } from "@/lib/session";
+import { supabaseServer, supabaseConfigured } from "@/lib/supabase/server";
 import { getDashboardKpis, type DashboardKpis } from "@/lib/services";
-import { DEPARTMENTS, type DepartmentName } from "@/lib/hcmData";
 
 const FALLBACK =
   "The AI summary is unavailable right now. The dashboard itself is unaffected — please try again in a moment.";
@@ -23,7 +24,6 @@ function collectNumbers(value: unknown, sink: number[]): void {
   if (typeof value === "number" && Number.isFinite(value)) {
     sink.push(value);
   } else if (typeof value === "string") {
-    // Numbers inside input strings (dates, period keys) are also grounded.
     for (const m of value.match(/\d+(?:\.\d+)?/g) ?? []) sink.push(Number(m));
   } else if (Array.isArray(value)) {
     for (const item of value) collectNumbers(item, sink);
@@ -37,10 +37,6 @@ function extractNumbersFromText(text: string): number[] {
   return matches.map((m) => Number(m.replace(/,/g, ""))).filter(Number.isFinite);
 }
 
-/**
- * Every number in a bullet must exist in the KPI input or be a trivially
- * derived percentage or difference of two input numbers.
- */
 function bulletIsGrounded(bullet: string, kpis: DashboardKpis): boolean {
   const inputNumbers: number[] = [];
   collectNumbers(kpis, inputNumbers);
@@ -53,10 +49,8 @@ function bulletIsGrounded(bullet: string, kpis: DashboardKpis): boolean {
     }
   }
   const numbersInBullet = extractNumbersFromText(bullet);
-  if (numbersInBullet.length === 0) return false; // a bullet without a figure adds nothing
-  return numbersInBullet.every((n) =>
-    [...allowed].some((v) => Math.abs(v - n) < 0.05)
-  );
+  if (numbersInBullet.length === 0) return false;
+  return numbersInBullet.every((n) => [...allowed].some((v) => Math.abs(v - n) < 0.05));
 }
 
 function parseBullets(raw: string): string[] {
@@ -67,9 +61,12 @@ function parseBullets(raw: string): string[] {
     .map((b) => b.trim());
 }
 
+function pkr(amount: number): string {
+  return `PKR ${amount.toLocaleString("en-US")}`;
+}
+
 function mockSummaryBullets(kpis: DashboardKpis): string[] {
-  const dept = kpis.filters.department;
-  const scope = dept === "All departments" ? "across all departments" : `in ${dept}`;
+  const scope = kpis.scope_note;
   const bullets = [
     `Headcount: ${kpis.headcount_active} active employees ${scope} as of ${kpis.as_of_date}.`,
     `Attendance in ${kpis.attendance_this_month.label}: ${kpis.attendance_this_month.attendance_rate}% over ${kpis.attendance_this_month.working_days} recorded working days (${kpis.attendance_this_month.present} present + ${kpis.attendance_this_month.late} late, ${kpis.attendance_this_month.absent} absent).`,
@@ -80,45 +77,45 @@ function mockSummaryBullets(kpis: DashboardKpis): string[] {
       `Top latecomer in ${kpis.attendance_this_month.label}: ${kpis.latecomers_top[0].name} with ${kpis.latecomers_top[0].late_count} late arrivals.`
     );
   }
-  bullets.push(
-    `Payroll for ${kpis.payroll.label}: ${pkr(kpis.payroll.total)} monthly total for ${kpis.payroll.headcount} active employees (average ${pkr(kpis.payroll.average)}).`
-  );
+  if (kpis.payroll) {
+    bullets.push(
+      `Payroll for ${kpis.payroll.label}: ${pkr(kpis.payroll.total)} monthly total for ${kpis.payroll.headcount} active employees (average ${pkr(kpis.payroll.average)}).`
+    );
+  }
   return bullets.slice(0, 5);
 }
 
-function pkr(amount: number): string {
-  return `PKR ${amount.toLocaleString("en-US")}`;
-}
-
 export async function POST(request: Request) {
-  const started = Date.now();
-  const session = await getSession();
-  if (!session) {
-    return Response.json({ error: "Not signed in." }, { status: 401 });
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
   }
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  const started = Date.now();
+  const supabase = await supabaseServer();
 
-  if (!checkFeaturePermission(session.role, "summary")) {
-    appendAiLog(session, {
-      feature: "summary",
-      outcome: "refused",
-      latency_ms: Date.now() - started,
-      provider: "none",
-      error_code: "forbidden_role",
+  if (!checkFeaturePermission(auth.session.role, "summary")) {
+    appendAuditEvent({
+      action: "ai_permission_denied",
+      actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+      targetType: "ai_request",
+      targetId: "dashboard-summary",
+      details: { feature: "summary", guard: "forbidden_role" },
     });
     return Response.json(
-      { error: "The AI summary is restricted to Admin and HR." },
+      { error: "The AI summary is restricted to Admin, HR and managers." },
       { status: 403 }
     );
   }
 
-  const rate = checkRateLimit(session.userId);
+  const rate = checkRateLimit(auth.session.userId);
   if (!rate.allowed) {
-    appendAiLog(session, {
-      feature: "summary",
-      outcome: "rate_limited",
-      latency_ms: Date.now() - started,
-      provider: "none",
-      error_code: "rate_limited",
+    appendAuditEvent({
+      action: "ai_call",
+      actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+      targetType: "ai_request",
+      targetId: "dashboard-summary",
+      details: { feature: "summary", outcome: "rate_limited", error_code: "rate_limited" },
     });
     return Response.json(
       { error: `You've reached the limit of ${RATE_LIMIT} assistant requests per hour. Please try again later.` },
@@ -131,15 +128,12 @@ export async function POST(request: Request) {
     | null;
   const departmentParam = typeof body?.filters?.department === "string" ? body.filters.department : undefined;
   const department =
-    departmentParam && (DEPARTMENTS as string[]).includes(departmentParam)
-      ? (departmentParam as DepartmentName)
-      : undefined;
+    departmentParam && departmentParam !== "All" ? departmentParam : undefined;
 
-  // The server recomputes the KPI JSON itself (Spec 7.2).
-  const kpis = getDashboardKpis(department);
+  // The server recomputes the KPI JSON itself (Spec 7.2), scoped by RLS.
+  const kpis = await getDashboardKpis(supabase, auth.session, department);
   const kpisJson = JSON.stringify(kpis, null, 2);
 
-  let outcome: AiOutcome = "answered";
   let provider: "gemini" | "mock" = "mock";
   let promptTokens = 0;
   let completionTokens = 0;
@@ -148,15 +142,10 @@ export async function POST(request: Request) {
 
   try {
     if (!AI_ENABLED) {
-      // Deterministic bullets are built from the KPI values themselves, but
-      // they still go through the same post-generation number check.
       const candidates = mockSummaryBullets(kpis);
       const grounded = candidates.filter((b) => bulletIsGrounded(b, kpis));
       bullets = grounded.length >= 3 ? grounded : null;
-      if (!bullets) {
-        outcome = "validation_failed";
-        errorCode = "number_check_failed";
-      }
+      if (!bullets) errorCode = "number_check_failed";
       provider = "mock";
       completionTokens = (bullets ?? []).join(" ").length / 4;
     } else {
@@ -180,14 +169,12 @@ export async function POST(request: Request) {
           break;
         }
         errorCode = "number_check_failed";
-        outcome = "validation_failed";
       }
-      if (!bullets) outcome = "validation_failed";
     }
   } catch (err) {
     // Fail soft: provider down/timeout -> deterministic grounded bullets.
-    outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
     errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
+    console.error(`[hcm] AI summary provider failure for ${auth.session.userId}:`, err);
     const candidates = mockSummaryBullets(kpis);
     const grounded = candidates.filter((b) => bulletIsGrounded(b, kpis));
     if (grounded.length >= 3) {
@@ -196,14 +183,20 @@ export async function POST(request: Request) {
     }
   }
 
-  appendAiLog(session, {
-    feature: "summary",
-    outcome,
-    latency_ms: Date.now() - started,
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    provider,
-    error_code: errorCode,
+  appendAuditEvent({
+    action: "ai_call",
+    actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+    targetType: "ai_request",
+    targetId: "dashboard-summary",
+    details: {
+      feature: "summary",
+      outcome: bullets ? "answered" : "validation_failed",
+      latency_ms: Date.now() - started,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      provider,
+      error_code: errorCode,
+    },
   });
 
   if (!bullets) {

@@ -6,11 +6,12 @@
  * Validation runs in the spec's fixed order; the first failure stops the
  * pipeline. On retryable failure the model is retried once, then the manual
  * form is shown — the user never sees a raw error.
+ *
+ * Public holidays come from the database (public.holidays); callers fetch
+ * the range with services.getHolidaysBetween and pass the date set in.
  */
 
 import { TIMEZONE, todayInTimezone } from "./services";
-import { holidayName, isPublicHoliday } from "./holidays";
-import { EMPLOYEES, LEAVE_REQUESTS, type LeaveType } from "./hcmData";
 
 export type SmartLeaveType = "annual" | "sick" | "casual";
 
@@ -63,13 +64,17 @@ export function weekdayOf(iso: string): number {
 }
 
 /** Count Mon–Fri non-holiday days in the inclusive range. */
-export function workingDaysBetween(start: string, end: string): number {
+export function workingDaysBetween(
+  start: string,
+  end: string,
+  holidays: Set<string> = new Set()
+): number {
   if (!isValidIsoDate(start) || !isValidIsoDate(end) || start > end) return 0;
   let count = 0;
   let cursor = start;
   while (cursor <= end) {
     const wd = weekdayOf(cursor);
-    if (wd !== 0 && wd !== 6 && !isPublicHoliday(cursor)) count++;
+    if (wd !== 0 && wd !== 6 && !holidays.has(cursor)) count++;
     cursor = addDays(cursor, 1);
   }
   return count;
@@ -196,7 +201,8 @@ const LEAVE_TYPE_SET: SmartLeaveType[] = ["annual", "sick", "casual"];
 
 export function validateSuggestion(
   value: unknown,
-  today: string
+  today: string,
+  holidays: Map<string, string> = new Map()
 ): ValidationResult {
   const warnings: string[] = [];
 
@@ -241,7 +247,7 @@ export function validateSuggestion(
     const wd = weekdayOf(cursor);
     if (wd === 0 || wd === 6) weekendDays.push(cursor);
     else {
-      const holiday = holidayName(cursor);
+      const holiday = holidays.get(cursor);
       if (holiday) holidayDays.push(`${cursor} (${holiday})`);
     }
     cursor = addDays(cursor, 1);
@@ -258,62 +264,11 @@ export function validateSuggestion(
   }
   if (weekdayOf(start) === 0 || weekdayOf(start) === 6) {
     warnings.push("The start date falls on a weekend.");
-  } else if (isPublicHoliday(start)) {
-    warnings.push(`The start date is a public holiday (${holidayName(start)}).`);
+  } else if (holidays.has(start)) {
+    warnings.push(`The start date is a public holiday (${holidays.get(start)}).`);
   }
 
   return { ok: true, warnings };
-}
-
-export function formatSuggestion(
-  type: SmartLeaveType,
-  start: string,
-  end: string,
-  reason: string,
-  warnings: string[] = []
-): { suggestion: LeaveSuggestion & { warnings: string[] } } {
-  return {
-    suggestion: { type, start, end, reason, warnings },
-  };
-}
-
-export { TIMEZONE };
-
-// ---------------------------------------------------------------------------
-// Smart suggestions (Checklist D.17): overlap warnings and a plain-language
-// risk explanation, computed from the same data the dashboard and the AI use.
-// ---------------------------------------------------------------------------
-
-export interface TeamOverlap {
-  teamSize: number;
-  offCount: number;
-  offNames: { name: string; type: string; dates: string }[];
-}
-
-/** Teammates (same department) with APPROVED leave overlapping the range. */
-export function teamOverlapFor(
-  userId: string,
-  start: string,
-  end: string
-): TeamOverlap {
-  const me = EMPLOYEES.find((e) => e.id === userId);
-  const department = me?.department;
-  const teammates = EMPLOYEES.filter(
-    (e) => e.department === department && e.status === "active" && e.id !== userId
-  );
-  const offNames: TeamOverlap["offNames"] = [];
-  for (const lr of LEAVE_REQUESTS) {
-    if (lr.status !== "approved") continue;
-    if (lr.start > end || lr.end < start) continue;
-    const person = teammates.find((e) => e.id === lr.employeeId);
-    if (!person) continue;
-    offNames.push({
-      name: person.name,
-      type: lr.type,
-      dates: `${lr.start} → ${lr.end}`,
-    });
-  }
-  return { teamSize: teammates.length, offCount: offNames.length, offNames };
 }
 
 /**
@@ -321,22 +276,24 @@ export function teamOverlapFor(
  * conflicts and holidays factored in. Deliberately advisory — HR decides.
  */
 export function approvalRiskNote(options: {
-  type: LeaveType;
+  type: SmartLeaveType;
   requestedWorkingDays: number;
   remaining: number;
   pendingDays: number;
-  overlap: TeamOverlap;
+  offCount: number;
+  teamSize: number;
+  offNames: string[];
 }): string {
   const parts: string[] = [];
-  const { type, requestedWorkingDays, remaining, pendingDays, overlap } = options;
+  const { type, requestedWorkingDays, remaining, pendingDays, offCount, teamSize, offNames } = options;
   if (requestedWorkingDays > remaining) {
     parts.push(
       `this request exceeds your remaining ${type} balance (${requestedWorkingDays} needed, ${remaining} left), so HR will likely reject it or ask you to change it`
     );
   }
-  if (overlap.offCount > 0) {
+  if (offCount > 0) {
     parts.push(
-      `${overlap.offCount} of your ${overlap.teamSize} teammates are already approved off during this window (${overlap.offNames.map((o) => o.name).join(", ")})${overlap.offCount >= 3 ? " — approvals get harder when the team is stretched thin" : ""}`
+      `${offCount} of your ${teamSize} teammates are already approved off during this window (${offNames.join(", ")})${offCount >= 3 ? " — approvals get harder when the team is stretched thin" : ""}`
     );
   }
   if (parts.length === 0) {
@@ -346,3 +303,5 @@ export function approvalRiskNote(options: {
   }
   return `Heads-up: ${parts.join("; ")}.`;
 }
+
+export { TIMEZONE };

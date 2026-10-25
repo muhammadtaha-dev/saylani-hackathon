@@ -1,66 +1,95 @@
 /**
  * Standard leave application endpoint (the "standard leave endpoint" the AI
  * must never call — LEAVE-07). Applies the same validation pipeline as the
- * Smart Leave pre-fill, plus balance, holiday, weekend and overlap checks,
- * then records a PENDING request for HR approval. The AI never writes anything.
+ * Smart Leave pre-fill — past dates, order, holidays (from public.holidays),
+ * weekends, overlap and balance — then records a PENDING request. The insert
+ * runs with the caller's JWT, so RLS guarantees the request can only be
+ * created for the caller themselves. Decisions (PATCH) are for Admin/HR or
+ * the employee's manager; every step is audit-logged and the affected people
+ * get Realtime notifications.
  *
- * GET  /api/leaves — my requests (employee) or all requests (Admin/HR).
- * POST /api/leaves — { type, start, end, reason } -> pending leave request.
+ * GET  /api/leaves — my requests (employee) or everything visible per RLS.
+ * POST /api/leaves — { type, start, end, reason, attachment_path? } -> pending.
  */
 
+import { requireSession } from "@/lib/session";
+import { supabaseServer, supabaseConfigured } from "@/lib/supabase/server";
 import {
-  addLeaveRequest,
-  ATTENDANCE_RECORDS,
-  findEmployeeById,
-  LEAVE_REQUESTS,
-  setLeaveRequestStatus,
-  type LeaveStatus,
-  type LeaveType,
-} from "@/lib/hcmData";
-import { getSession } from "@/lib/session";
-import { getMyLeaveBalanceService, todayIso } from "@/lib/services";
-import { isValidIsoDate, workingDaysBetween, teamOverlapFor, approvalRiskNote } from "@/lib/smartLeave";
-import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
+  getHolidaysBetween,
+  getMyLeaveBalanceService,
+  getTeamOverlapService,
+  todayIso,
+} from "@/lib/services";
+import { isValidIsoDate, workingDaysBetween, approvalRiskNote } from "@/lib/smartLeave";
+import { appendAuditEventAsync, ipFromRequest } from "@/lib/audit";
 
-const LEAVE_TYPE_SET: LeaveType[] = ["annual", "sick", "casual"];
+const LEAVE_TYPE_SET = ["annual", "sick", "casual"] as const;
+type LeaveTypeId = (typeof LEAVE_TYPE_SET)[number];
 
 export async function GET() {
-  const session = await getSession();
-  if (!session) {
-    return Response.json({ error: "Not signed in." }, { status: 401 });
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
   }
-  if (session.role === "employee") {
-    return Response.json({
-      scope: "own",
-      requests: LEAVE_REQUESTS.filter((lr) => lr.employeeId === session.userId).sort((a, b) =>
-        b.appliedOn.localeCompare(a.appliedOn)
-      ),
-    });
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  const supabase = await supabaseServer();
+
+  // RLS scopes this automatically: employees see their own, managers their
+  // own + direct reports, HR/Admin everything.
+  const { data, error } = await supabase
+    .from("leave_requests")
+    .select(
+      "*, profiles!leave_requests_employee_id_fkey(full_name, department)"
+    )
+    .order("applied_at", { ascending: false });
+  if (error) {
+    return Response.json({ error: error.message }, { status: 500 });
   }
+
+  const rows = (data ?? []).map((r: Record<string, unknown>) => {
+    const profile = r.profiles as { full_name: string; department: string } | null;
+    return {
+      id: r.id,
+      employee_id: r.employee_id,
+      employee_name: profile?.full_name ?? r.employee_id,
+      department: profile?.department ?? "",
+      type: r.leave_type_id,
+      start: r.start_date,
+      end: r.end_date,
+      days: Number(r.days),
+      status: r.status,
+      reason: r.reason,
+      decision_comment: r.decision_comment,
+      attachment_path: r.attachment_path,
+      appliedOn: (r.applied_at as string)?.slice(0, 10) ?? "",
+    };
+  });
+
   return Response.json({
-    scope: "all",
-    requests: LEAVE_REQUESTS.map((lr) => {
-      const employee = findEmployeeById(lr.employeeId);
-      return { ...lr, employee_name: employee?.name ?? lr.employeeId, department: employee?.department ?? "" };
-    }).sort((a, b) => b.appliedOn.localeCompare(a.appliedOn)),
+    scope: auth.session.role === "employee" ? "own" : "visible",
+    requests: rows,
   });
 }
 
 export async function POST(request: Request) {
-  const session = await getSession();
-  if (!session) {
-    return Response.json({ error: "Not signed in." }, { status: 401 });
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
   }
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  const supabase = await supabaseServer();
+  const session = auth.session;
 
   const body = (await request.json().catch(() => null)) as
-    | { type?: unknown; start?: unknown; end?: unknown; reason?: unknown }
+    | { type?: unknown; start?: unknown; end?: unknown; reason?: unknown; attachment_path?: unknown }
     | null;
   const type = body?.type;
   const start = body?.start;
   const end = body?.end;
   const reason = body?.reason;
+  const attachmentPath = typeof body?.attachment_path === "string" ? body.attachment_path : null;
 
-  if (typeof type !== "string" || !LEAVE_TYPE_SET.includes(type as LeaveType)) {
+  if (typeof type !== "string" || !LEAVE_TYPE_SET.includes(type as LeaveTypeId)) {
     return Response.json({ error: "Please choose a valid leave type (annual, sick or casual)." }, { status: 400 });
   }
   if (typeof start !== "string" || typeof end !== "string" || !isValidIsoDate(start) || !isValidIsoDate(end)) {
@@ -76,15 +105,18 @@ export async function POST(request: Request) {
     return Response.json({ error: "Please add a short reason (3–200 characters)." }, { status: 400 });
   }
 
+  // Public holidays for the range (from the database).
+  const holidays = await getHolidaysBetween(supabase, start, end);
+
   // Overlap with an existing pending/approved request.
-  const overlaps = LEAVE_REQUESTS.some(
-    (lr) =>
-      lr.employeeId === session.userId &&
-      (lr.status === "pending" || lr.status === "approved") &&
-      lr.start <= end &&
-      lr.end >= start
-  );
-  if (overlaps) {
+  const { data: overlaps } = await supabase
+    .from("leave_requests")
+    .select("id")
+    .eq("employee_id", session.userId)
+    .in("status", ["pending", "approved"])
+    .lte("start_date", end)
+    .gte("end_date", start);
+  if ((overlaps ?? []).length > 0) {
     return Response.json(
       { error: "You already have a pending or approved leave overlapping those dates." },
       { status: 400 }
@@ -92,7 +124,7 @@ export async function POST(request: Request) {
   }
 
   // Balance check (working days only — weekends and public holidays are not leave days).
-  const days = workingDaysBetween(start, end);
+  const days = workingDaysBetween(start, end, new Set(holidays.keys()));
   if (days <= 0) {
     return Response.json(
       { error: "That range contains no working days (weekends and public holidays are not counted)." },
@@ -100,7 +132,9 @@ export async function POST(request: Request) {
     );
   }
   const year = Number(start.slice(0, 4));
-  const balance = getMyLeaveBalanceService(session.userId, year).balances.find((b) => b.type === type);
+  const balance = (await getMyLeaveBalanceService(supabase, session.userId, year)).balances.find(
+    (b) => b.type === type
+  );
   if (balance && days > balance.remaining) {
     return Response.json(
       {
@@ -110,31 +144,62 @@ export async function POST(request: Request) {
     );
   }
 
-  const nowIso = new Date().toISOString();
-  const newRequest = {
-    id: `LR-${Date.now()}`,
-    employeeId: session.userId,
-    type: type as LeaveType,
-    start,
-    end,
-    days,
-    status: "pending" as const,
-    reason: reason.trim(),
-    appliedOn: nowIso.slice(0, 10),
-  };
-  addLeaveRequest(newRequest);
+  const { data: inserted, error: insertError } = await supabase
+    .from("leave_requests")
+    .insert({
+      employee_id: session.userId, // RLS with-check forces this to be the caller
+      leave_type_id: type as LeaveTypeId,
+      start_date: start,
+      end_date: end,
+      days,
+      status: "pending",
+      reason: reason.trim(),
+      attachment_path: attachmentPath,
+    })
+    .select("id, employee_id, leave_type_id, start_date, end_date, days, status, reason, applied_at")
+    .single();
 
-  appendAuditEvent({
+  if (insertError || !inserted) {
+    return Response.json(
+      { error: insertError?.message ?? "Could not submit the leave request." },
+      { status: 400 }
+    );
+  }
+
+  await appendAuditEventAsync({
     action: "leave_submitted",
     actor: { userId: session.userId, name: session.name, role: session.role },
     targetType: "leave_request",
-    targetId: newRequest.id,
+    targetId: inserted.id,
     ip: ipFromRequest(request),
-    after: { ...newRequest },
+    after: { ...inserted },
   });
 
+  // Notify the approvers (the employee's manager, plus HR/Admin) — they get
+  // the message over Supabase Realtime.
+  const recipients = new Set<string>();
+  if (session.managerId) recipients.add(session.managerId);
+  const { data: hrAdmins } = await supabase
+    .from("profiles")
+    .select("id")
+    .in("role", ["hr", "admin"])
+    .eq("status", "active");
+  for (const p of hrAdmins ?? []) recipients.add(p.id);
+  recipients.delete(session.userId);
+  if (recipients.size > 0) {
+    await supabase.from("notifications").insert(
+      [...recipients].map((userId) => ({
+        user_id: userId,
+        title: "New leave request",
+        body: `${session.name} requested ${type} leave ${start} → ${end} (${days} day${days === 1 ? "" : "s"}).`,
+        type: "leave_submitted",
+        link: "/",
+      }))
+    );
+  }
+
   // Smart suggestions (D.17): team-overlap warning + plain-language risk note.
-  const overlap = teamOverlapFor(session.userId, start, end);
+  const overlap = await getTeamOverlapService(supabase, start, end);
   const warnings: string[] = [];
   if (overlap.offCount > 0) {
     warnings.push(
@@ -142,40 +207,45 @@ export async function POST(request: Request) {
     );
   }
   const riskNote = approvalRiskNote({
-    type: type as LeaveType,
+    type: type as LeaveTypeId,
     requestedWorkingDays: days,
     remaining: balance?.remaining ?? 0,
     pendingDays: balance?.pending ?? 0,
-    overlap,
+    offCount: overlap.offCount,
+    teamSize: overlap.teamSize,
+    offNames: overlap.offNames.map((o) => o.name),
   });
 
-  return Response.json({ request: newRequest, warnings, risk_note: riskNote }, { status: 201 });
+  return Response.json({ request: inserted, warnings, risk_note: riskNote }, { status: 201 });
 }
 
 /**
- * PATCH /api/leaves — Admin/HR approve or reject a PENDING leave request.
- * Approval updates the employee's balance automatically (only approved
- * leaves consume quota) and marks seeded attendance days as "leave" when
- * the range overlaps recorded working days. Employees cannot access this.
- * Both decisions are appended to the audit trail with before/after values.
+ * PATCH /api/leaves — Admin/HR (any request) or the employee's manager (their
+ * reports' requests) approve or reject a PENDING request. Rejection requires
+ * a comment. Approval writes 'leave' attendance rows for the working days so
+ * the calendar reconciles. Both decisions are audit-logged with before/after
+ * values and notified over Realtime.
  */
 export async function PATCH(request: Request) {
-  const session = await getSession();
-  if (!session) {
-    return Response.json({ error: "Not signed in." }, { status: 401 });
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
   }
-  if (session.role !== "admin" && session.role !== "hr") {
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  if (!["admin", "hr", "manager"].includes(auth.session.role)) {
     return Response.json(
-      { error: "Only Admin and HR can process leave requests." },
+      { error: "Only Admin, HR and the employee's manager can process leave requests." },
       { status: 403 }
     );
   }
+  const supabase = await supabaseServer();
+  const session = auth.session;
 
   const body = (await request.json().catch(() => null)) as
     | { id?: unknown; status?: unknown; comment?: unknown }
     | null;
   const id = typeof body?.id === "string" ? body.id : "";
-  const status = typeof body?.status === "string" ? (body.status as LeaveStatus) : "";
+  const status = typeof body?.status === "string" ? body.status : "";
   const comment = typeof body?.comment === "string" ? body.comment.trim().slice(0, 300) : "";
   if (!id || (status !== "approved" && status !== "rejected")) {
     return Response.json({ error: "Please provide a request id and status (approved/rejected)." }, { status: 400 });
@@ -187,8 +257,13 @@ export async function PATCH(request: Request) {
     );
   }
 
-  const leaveRequest = LEAVE_REQUESTS.find((lr) => lr.id === id);
+  const { data: leaveRequest } = await supabase
+    .from("leave_requests")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
   if (!leaveRequest) {
+    // 404 both when it does not exist and when RLS hides it from this caller.
     return Response.json({ error: "Leave request not found." }, { status: 404 });
   }
   if (leaveRequest.status !== "pending") {
@@ -199,38 +274,74 @@ export async function PATCH(request: Request) {
   }
 
   const before = { ...leaveRequest };
-  setLeaveRequestStatus(id, status);
+  const { data: updated, error: updateError } = await supabase
+    .from("leave_requests")
+    .update({
+      status,
+      decision_comment: comment || null,
+      decided_by: session.userId, // server-side identity, never from the body
+      decided_at: new Date().toISOString(),
+    })
+    .eq("id", id)
+    .select("*")
+    .single();
+  if (updateError || !updated) {
+    // RLS or the guard trigger refused the decision for this caller.
+    return Response.json(
+      { error: updateError?.message ?? "You are not allowed to decide this request." },
+      { status: 403 }
+    );
+  }
 
-  // Keep attendance consistent with the approved leave (seeded days only).
   if (status === "approved") {
-    for (const record of ATTENDANCE_RECORDS) {
-      if (
-        record.employeeId === leaveRequest.employeeId &&
-        record.date >= leaveRequest.start &&
-        record.date <= leaveRequest.end
-      ) {
-        record.status = "leave";
-        delete record.checkIn;
+    // Keep the attendance calendar consistent: mark the working days as leave.
+    const holidays = await getHolidaysBetween(supabase, updated.start_date, updated.end_date);
+    const rows: { employee_id: string; date: string; status: "leave" }[] = [];
+    let cursor = updated.start_date;
+    while (cursor <= updated.end_date) {
+      const wd = new Date(`${cursor}T00:00:00Z`).getUTCDay();
+      if (wd !== 0 && wd !== 6 && !holidays.has(cursor)) {
+        rows.push({ employee_id: updated.employee_id, date: cursor, status: "leave" });
       }
+      cursor = addDaysIso(cursor, 1);
+    }
+    if (rows.length > 0) {
+      await supabase.from("attendance").upsert(rows, { onConflict: "employee_id,date" });
     }
   }
 
-  appendAuditEvent({
+  await appendAuditEventAsync({
     action: status === "approved" ? "leave_approved" : "leave_rejected",
     actor: { userId: session.userId, name: session.name, role: session.role },
     targetType: "leave_request",
     targetId: id,
     ip: ipFromRequest(request),
     before,
-    after: { ...leaveRequest },
+    after: { ...updated },
     details: comment ? { comment } : null,
   });
 
-  const employee = findEmployeeById(leaveRequest.employeeId);
+  await supabase.from("notifications").insert({
+    user_id: updated.employee_id,
+    title: status === "approved" ? "Leave approved" : "Leave rejected",
+    body:
+      status === "approved"
+        ? `Your ${updated.leave_type_id} leave ${updated.start_date} → ${updated.end_date} was approved by ${session.name}.`
+        : `Your ${updated.leave_type_id} leave ${updated.start_date} → ${updated.end_date} was rejected by ${session.name}: ${comment}`,
+    type: status === "approved" ? "leave_approved" : "leave_rejected",
+    link: "/",
+  });
+
+  const { data: employee } = await supabase
+    .from("profiles")
+    .select("full_name, department")
+    .eq("id", updated.employee_id)
+    .single();
+
   return Response.json({
     request: {
-      ...leaveRequest,
-      employee_name: employee?.name ?? leaveRequest.employeeId,
+      ...updated,
+      employee_name: employee?.full_name ?? updated.employee_id,
       department: employee?.department ?? "",
     },
     note:
@@ -238,4 +349,10 @@ export async function PATCH(request: Request) {
         ? "Approved — the employee's remaining balance now reflects this leave."
         : "Rejected — the employee's balance is unaffected (pending leaves never consumed quota).",
   });
+}
+
+function addDaysIso(iso: string, days: number): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d + days));
+  return date.toISOString().slice(0, 10);
 }

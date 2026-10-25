@@ -69,6 +69,20 @@ export function MyDashboard({
   const canCancel = (r: MySnapshot["my_requests"][number]) =>
     r.status === "pending" || (r.status === "approved" && r.start > today);
 
+  async function openAttachment(path: string) {
+    try {
+      const res = await fetch(`/api/leaves/attachment?path=${encodeURIComponent(path)}`);
+      const data = (await res.json()) as { signedUrl?: string; error?: string };
+      if (!res.ok || !data.signedUrl) {
+        setNotice({ tone: "error", text: data.error ?? "Could not open the attachment." });
+        return;
+      }
+      window.open(data.signedUrl, "_blank");
+    } catch {
+      setNotice({ tone: "error", text: "Could not reach the server." });
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -164,6 +178,15 @@ export function MyDashboard({
                     </td>
                     <td className="py-2 pr-3 text-slate-500">{r.reason}</td>
                     <td className="py-2 text-right">
+                      {r.attachment_path && (
+                        <button
+                          type="button"
+                          onClick={() => openAttachment(r.attachment_path!)}
+                          className="mr-1.5 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700"
+                        >
+                          Attachment
+                        </button>
+                      )}
                       {canCancel(r) && (
                         <button
                           type="button"

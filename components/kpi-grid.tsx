@@ -40,9 +40,9 @@ export function KpiGrid({ kpis }: { kpis: DashboardKpis }) {
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
       <KpiCard
         icon={<Users className="h-4 w-4 text-emerald-600" />}
-        label="Active Headcount"
+        label={kpis.scope_note.includes("direct reports") ? "Team Headcount" : "Active Headcount"}
         value={String(kpis.headcount_active)}
-        sub={`${kpis.filters.department} · as of ${kpis.as_of_date}`}
+        sub={`${kpis.scope_note} · as of ${kpis.as_of_date}`}
         tone="bg-emerald-50"
       />
       <KpiCard
@@ -73,13 +73,15 @@ export function KpiGrid({ kpis }: { kpis: DashboardKpis }) {
         sub={`${a.working_days} working days recorded`}
         tone="bg-indigo-50"
       />
-      <KpiCard
-        icon={<Wallet className="h-4 w-4 text-violet-600" />}
-        label={`Payroll · ${kpis.payroll.label}`}
-        value={compactPkr(kpis.payroll.total)}
-        sub={`avg ${compactPkr(kpis.payroll.average)} · ${kpis.payroll.headcount} staff`}
-        tone="bg-violet-50"
-      />
+      {kpis.payroll ? (
+        <KpiCard
+          icon={<Wallet className="h-4 w-4 text-violet-600" />}
+          label={`Payroll · ${kpis.payroll.label}`}
+          value={compactPkr(kpis.payroll.total)}
+          sub={`avg ${compactPkr(kpis.payroll.average)} · ${kpis.payroll.headcount} staff`}
+          tone="bg-violet-50"
+        />
+      ) : null}
     </div>
   );
 }

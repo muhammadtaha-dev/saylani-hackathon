@@ -1,16 +1,18 @@
 /**
- * POST /api/auth/login — email + password authentication.
- * Failures are generic (no account enumeration — the same message for an
- * unknown email and a wrong password) and throttled per email. Success and
- * every failure are appended to the audit trail with the client IP.
+ * POST /api/auth/login — Supabase Auth (email + password).
+ * The session is stored in HTTP-only cookies by @supabase/ssr; identity is
+ * never accepted from the request body afterwards. Failures are generic (no
+ * account enumeration) and throttled per email; successes and failures are
+ * appended to the append-only audit trail with the client IP.
  */
 
-import { findEmployeeByEmail } from "@/lib/hcmData";
-import { clearLoginFailures, loginLocked, recordLoginFailure, verifyPassword } from "@/lib/auth";
-import { sessionSetCookie } from "@/lib/session";
+import { loginLocked, recordLoginFailure, clearLoginFailures } from "@/lib/auth";
 import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
+import { supabaseServer, supabaseConfigured } from "@/lib/supabase/server";
 
 const GENERIC_FAILURE = "Invalid email or password. Please try again.";
+const SETUP_FAILURE =
+  "The database is not configured yet. Ask your administrator to set the Supabase environment variables.";
 
 export async function POST(request: Request) {
   const ip = ipFromRequest(request);
@@ -23,6 +25,9 @@ export async function POST(request: Request) {
   if (!email || !password) {
     return Response.json({ error: "Please enter your email and password." }, { status: 400 });
   }
+  if (!supabaseConfigured()) {
+    return Response.json({ error: SETUP_FAILURE }, { status: 503 });
+  }
 
   const lockedFor = loginLocked(email);
   if (lockedFor > 0) {
@@ -32,8 +37,9 @@ export async function POST(request: Request) {
     );
   }
 
-  const user = findEmployeeByEmail(email);
-  if (!user || !verifyPassword(password, user.passwordHash ?? "")) {
+  const supabase = await supabaseServer();
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error || !data.user) {
     recordLoginFailure(email);
     appendAuditEvent({
       action: "login_failed",
@@ -41,29 +47,27 @@ export async function POST(request: Request) {
       targetType: "auth",
       targetId: email,
       ip,
-      details: { reason: user ? "wrong_password" : "unknown_email" },
+      details: { reason: "invalid_credentials" },
     });
     return Response.json({ error: GENERIC_FAILURE }, { status: 401 });
   }
-  if (user.status !== "active") {
+
+  // Deactivated accounts are signed out immediately.
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("id, full_name, role, department, status")
+    .eq("id", data.user.id)
+    .single();
+
+  if (!profile || profile.status !== "active") {
+    await supabase.auth.signOut();
     appendAuditEvent({
       action: "login_failed",
-      actor: { userId: user.id, name: user.name, role: user.role },
+      actor: { userId: String(profile?.id ?? data.user.id), name: String(profile?.full_name ?? email), role: String(profile?.role ?? "employee") },
       targetType: "auth",
-      targetId: user.id,
+      targetId: String(profile?.id ?? data.user.id),
       ip,
-      details: { reason: "account_removed" },
-    });
-    return Response.json({ error: GENERIC_FAILURE }, { status: 401 });
-  }
-  if (!(user.passwordHash ?? "")) {
-    appendAuditEvent({
-      action: "login_failed",
-      actor: { userId: user.id, name: user.name, role: user.role },
-      targetType: "auth",
-      targetId: user.id,
-      ip,
-      details: { reason: "no_password_set" },
+      details: { reason: profile ? "account_removed" : "profile_missing" },
     });
     return Response.json({ error: GENERIC_FAILURE }, { status: 401 });
   }
@@ -71,20 +75,18 @@ export async function POST(request: Request) {
   clearLoginFailures(email);
   appendAuditEvent({
     action: "login_success",
-    actor: { userId: user.id, name: user.name, role: user.role },
+    actor: { userId: profile.id, name: profile.full_name, role: profile.role },
     targetType: "auth",
-    targetId: user.id,
+    targetId: profile.id,
     ip,
   });
-  return Response.json(
-    {
-      session: {
-        userId: user.id,
-        name: user.name,
-        role: user.role,
-        department: user.department,
-      },
+
+  return Response.json({
+    session: {
+      userId: profile.id,
+      name: profile.full_name,
+      role: profile.role,
+      department: profile.department,
     },
-    { headers: { "Set-Cookie": sessionSetCookie(user.id) } }
-  );
+  });
 }

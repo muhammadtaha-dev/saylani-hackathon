@@ -14,6 +14,18 @@ describe("tool permission matrix", () => {
     }
   });
 
+  it("denies managers the payroll aggregate", () => {
+    expect(checkToolPermission("manager", "get_payroll_summary").allowed).toBe(false);
+  });
+
+  it("allows managers team-scoped tools", () => {
+    for (const tool of ["get_headcount", "get_attendance_summary", "get_leave_summary", "get_late_comers", "get_pending_leave_requests"] as const) {
+      const decision = checkToolPermission("manager", tool);
+      expect(decision.allowed).toBe(true);
+      expect(decision.restriction).toBe("team_scope");
+    }
+  });
+
   it("allows employees their own balance, own attendance and the who-is-off directory", () => {
     expect(checkToolPermission("employee", "get_my_leave_balance").allowed).toBe(true);
     expect(checkToolPermission("employee", "get_on_leave_today").allowed).toBe(true);
@@ -32,41 +44,48 @@ describe("tool permission matrix", () => {
 });
 
 describe("feature permissions", () => {
-  it("restricts the AI summary and logs to Admin/HR", () => {
+  it("restricts the AI summary and logs to Admin/HR/managers", () => {
     expect(checkFeaturePermission("admin", "summary")).toBe(true);
     expect(checkFeaturePermission("hr", "summary")).toBe(true);
+    expect(checkFeaturePermission("manager", "summary")).toBe(true);
     expect(checkFeaturePermission("employee", "summary")).toBe(false);
     expect(checkFeaturePermission("employee", "logs")).toBe(false);
+    expect(checkFeaturePermission("manager", "logs")).toBe(false);
   });
 
-  it("restricts smart leave to employees", () => {
+  it("restricts smart leave to employees and managers", () => {
     expect(checkFeaturePermission("employee", "smart_leave")).toBe(true);
+    expect(checkFeaturePermission("manager", "smart_leave")).toBe(true);
     expect(checkFeaturePermission("hr", "smart_leave")).toBe(false);
   });
 
   it("allows everyone the chat", () => {
-    for (const role of ["admin", "hr", "employee"] as const) {
+    for (const role of ["admin", "hr", "manager", "employee"] as const) {
       expect(checkFeaturePermission(role, "chat")).toBe(true);
     }
   });
 });
 
 describe("user-management permissions", () => {
-  it("lets Admin manage HR and Employee accounts only", () => {
+  it("lets Admin manage HR, Manager and Employee accounts only", () => {
     expect(canManageUser("admin", "hr")).toBe(true);
+    expect(canManageUser("admin", "manager")).toBe(true);
     expect(canManageUser("admin", "employee")).toBe(true);
     expect(canManageUser("admin", "admin")).toBe(false);
   });
 
   it("lets HR manage Employee accounts only", () => {
     expect(canManageUser("hr", "employee")).toBe(true);
+    expect(canManageUser("hr", "manager")).toBe(false);
     expect(canManageUser("hr", "hr")).toBe(false);
     expect(canManageUser("hr", "admin")).toBe(false);
   });
 
-  it("lets employees manage nobody", () => {
+  it("lets managers and employees manage nobody", () => {
+    expect(canManageUser("manager", "employee")).toBe(false);
     expect(canManageUser("employee", "employee")).toBe(false);
     expect(canListUsers("employee")).toBe(false);
+    expect(canListUsers("manager")).toBe(false);
   });
 });
 

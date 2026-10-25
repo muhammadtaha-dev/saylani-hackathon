@@ -18,7 +18,9 @@ export const metadata: Metadata = {
     "HCM Lite with the AI Assistant module: dashboard summary, ask-the-assistant chat, smart leave and an append-only audit trail. Database-grounded, permission-checked, fully labelled.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({
+  children,
+}: Readonly<{ children: React.ReactNode }>) {
   return (
     <html
       lang="en"

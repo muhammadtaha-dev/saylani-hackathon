@@ -13,6 +13,22 @@
 
 const BASE = process.env.E2E_URL ?? "http://localhost:3000";
 
+async function preflight() {
+  try {
+    const res = await fetch(`${BASE}/api/session`);
+    const data = await res.json();
+    if (data.configured === false) {
+      console.log(
+        "Supabase is not configured on the target server (set the SUPABASE env vars and run scripts/seed-supabase.mjs). Skipping e2e."
+      );
+      process.exit(0);
+    }
+  } catch {
+    console.log(`Server not reachable at ${BASE}. Start it with npm run dev (or npm start) first.`);
+    process.exit(1);
+  }
+}
+
 let passed = 0;
 let failed = 0;
 const failures = [];
@@ -54,6 +70,7 @@ async function login(email, password) {
 }
 
 async function main() {
+  await preflight();
   console.log(`\nHCM Lite e2e — ${BASE}\n`);
 
   // ---------------- A. Authentication ----------------

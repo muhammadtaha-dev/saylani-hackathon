@@ -1,19 +1,16 @@
 /**
  * HCM Lite — tool registry (Art. II closed list, Art. IV tool-calling rules).
  *
- * Seven tools, each with a strict typed schema. The executor validates
+ * Nine tools, each with a strict typed schema. The executor validates
  * arguments (never silently "fixing" them), checks role x tool x arguments
- * via the shared permission layer, runs the shared service in the caller's
- * scope, and wraps everything in the common result envelope. Every call is
- * appended to ai_logs.
+ * via the shared permission layer, runs the shared service with the CALLER'S
+ * Supabase client (their JWT — so Row Level Security bounds every query),
+ * and wraps everything in the common result envelope. Every call — and every
+ * denial — is appended to the append-only audit trail.
  */
 
 import { z } from "zod";
-import {
-  DEPARTMENTS,
-  type DepartmentName,
-  type LeaveType,
-} from "./hcmData";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   checkToolPermission,
   type SessionIdentity,
@@ -30,8 +27,8 @@ import {
   getPayrollSummaryService,
   getPendingLeaveRequestsService,
   searchEmployeesService,
+  type Scope,
 } from "./services";
-import { appendAiLog, type AiFeature } from "./aiLogs";
 import { appendAuditEvent } from "./audit";
 
 // ---------------------------------------------------------------------------
@@ -75,8 +72,8 @@ function errorEnvelope(code: string, issues?: string[]): ToolEnvelope {
 
 const departmentSchema = z
   .string()
-  .refine((v): v is DepartmentName => (DEPARTMENTS as string[]).includes(v), {
-    message: `department must be one of: ${DEPARTMENTS.join(", ")}`,
+  .refine((v) => ["Engineering", "Sales", "HR"].includes(v), {
+    message: "department must be one of: Engineering, Sales, HR",
   });
 
 const periodSchema = z
@@ -90,7 +87,7 @@ const periodSchema = z
   );
 
 const leaveTypeSchema = z.string().refine(
-  (v): v is LeaveType => ["annual", "sick", "casual"].includes(v),
+  (v): v is "annual" | "sick" | "casual" => ["annual", "sick", "casual"].includes(v),
   { message: "type must be annual, sick or casual" }
 );
 
@@ -154,7 +151,7 @@ export const GEMINI_TOOL_DECLARATIONS = [
   {
     name: "get_headcount",
     description:
-      "Count employees. Returns { department, status, count, as_of }. Use for 'how many employees' questions.",
+      "Count employees. Returns { department, status, count, as_of }. Use for 'how many employees' questions. For a manager this is scoped to their team.",
     parameters: schemaObject({
       department: schemaEnum("Filter by department; omit for all", DEPTS),
       status: schemaEnum("Employment status, default active", ["active", "inactive", "all"]),
@@ -163,7 +160,7 @@ export const GEMINI_TOOL_DECLARATIONS = [
   {
     name: "get_attendance_summary",
     description:
-      "Attendance aggregates for a period: present, absent, late, on_leave, working_days and attendance_rate. For employees this always returns the caller's OWN record only.",
+      "Attendance aggregates for a period: present, absent, late, on_leave, working_days and attendance_rate. For employees this always returns the caller's OWN record only; for managers their team.",
     parameters: schemaObject({
       department: schemaEnum("Filter by department; omit for all", DEPTS),
       period: schemaEnum("Period, default this_month", PERIODS),
@@ -226,20 +223,21 @@ export const GEMINI_TOOL_DECLARATIONS = [
   {
     name: "get_pending_leave_requests",
     description:
-      "The leave requests currently awaiting approval: employee, type, dates and reason. Admin/HR only.",
+      "The leave requests currently awaiting approval (scoped: managers see their direct reports, HR/Admin see all): employee, type, dates and reason.",
     parameters: schemaObject({}),
   },
 ];
 
 // ---------------------------------------------------------------------------
-// Executor: validate -> authorise -> run -> wrap -> log
+// Executor: validate -> authorise -> run -> wrap -> audit-log
 // ---------------------------------------------------------------------------
 
 export interface ExecuteOptions {
-  feature: AiFeature;
+  feature: "chat" | "summary" | "smart_leave" | "policy";
 }
 
 export async function executeTool(
+  db: SupabaseClient,
   name: string,
   rawArgs: unknown,
   session: SessionIdentity,
@@ -251,7 +249,7 @@ export async function executeTool(
 
   if (!schema) {
     const envelope = errorEnvelope("unknown_tool", [`'${name}' is not a registered tool.`]);
-    logCall(session, options.feature, name, null, "error", envelope, started, "unknown_tool");
+    logCall(session, options.feature, name, null, "error", started, "unknown_tool");
     return envelope;
   }
 
@@ -259,18 +257,14 @@ export async function executeTool(
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "args"}: ${i.message}`);
     const envelope = errorEnvelope("invalid_arguments", issues);
-    logCall(session, options.feature, name, rawArgs, "error", envelope, started, "invalid_arguments");
+    logCall(session, options.feature, name, rawArgs, "error", started, "invalid_arguments");
     return envelope;
   }
 
   const args = parsed.data as Record<string, unknown>;
   const permission = checkToolPermission(session.role, toolName);
   if (!permission.allowed) {
-    const envelope = forbidden(
-      "This request is not permitted for your role. The assistant cannot disclose it."
-    );
-    logCall(session, options.feature, name, args, "forbidden", envelope, started, "forbidden");
-    // Permission denials also land in the unified audit trail (Checklist E.22).
+    // Permission denials land in the append-only audit trail (Checklist E.22).
     appendAuditEvent({
       action: "ai_permission_denied",
       actor: { userId: session.userId, name: session.name, role: session.role },
@@ -278,36 +272,44 @@ export async function executeTool(
       targetId: name,
       details: { feature: options.feature, args },
     });
-    return envelope;
+    logCall(session, options.feature, name, args, "forbidden", started, "forbidden");
+    return forbidden("This request is not permitted for your role. The assistant cannot disclose it.");
   }
 
   let envelope: ToolEnvelope;
   try {
-    envelope = runTool(toolName, args, session, permission.restriction);
+    envelope = await runTool(db, toolName, args, session, permission.restriction);
   } catch (err) {
     const envelope = errorEnvelope("tool_failure", [
       err instanceof Error ? err.message : "unknown error",
     ]);
-    logCall(session, options.feature, name, args, "error", envelope, started, "tool_failure");
+    logCall(session, options.feature, name, args, "error", started, "tool_failure");
     return envelope;
   }
 
-  logCall(session, options.feature, name, args, "ok", envelope, started, null);
+  logCall(session, options.feature, name, args, "ok", started, null);
   return envelope;
 }
 
-function runTool(
+function scopeOf(session: SessionIdentity, department?: string): Scope {
+  return { userId: session.userId, role: session.role, department };
+}
+
+async function runTool(
+  db: SupabaseClient,
   toolName: ToolName,
   args: Record<string, unknown>,
   session: SessionIdentity,
-  restriction?: "own_record_only"
-): ToolEnvelope {
-  const department = args.department as DepartmentName | undefined;
+  restriction?: "own_record_only" | "team_scope"
+): Promise<ToolEnvelope> {
+  const department = args.department as string | undefined;
   const period = args.period as string | undefined;
 
   switch (toolName) {
     case "get_headcount": {
-      const result = getHeadcountService(
+      const result = await getHeadcountService(
+        db,
+        scopeOf(session, department),
         department,
         (args.status as "active" | "inactive" | "all") ?? "active"
       );
@@ -317,8 +319,8 @@ function runTool(
       // Employee calls are scoped to their own record, whatever they asked for.
       const result =
         restriction === "own_record_only"
-          ? getMyAttendanceSummaryService(session.userId, period)
-          : getAttendanceSummaryService(department, period);
+          ? await getMyAttendanceSummaryService(db, session.userId, period)
+          : await getAttendanceSummaryService(db, scopeOf(session, department), department, period);
       if (result.working_days === 0) {
         return notFound("No attendance records found for that period.");
       }
@@ -329,6 +331,9 @@ function runTool(
       if (restriction === "own_record_only") {
         meta.note =
           "Restricted to the caller's own attendance records. If the user asked about someone else, say you can only share their own record.";
+      } else if (restriction === "team_scope") {
+        meta.note =
+          "Scoped by Row Level Security to the caller and their direct reports. If the user asked about the whole company, say this covers only their team.";
       }
       return ok(
         {
@@ -346,7 +351,9 @@ function runTool(
       );
     }
     case "get_late_comers": {
-      const result = getLateComersService(
+      const result = await getLateComersService(
+        db,
+        scopeOf(session, department),
         department,
         period,
         (args.limit as number | undefined) ?? 5
@@ -364,10 +371,12 @@ function runTool(
       );
     }
     case "get_leave_summary": {
-      const result = getLeaveSummaryService(
+      const result = await getLeaveSummaryService(
+        db,
+        scopeOf(session, department),
         department,
         period,
-        args.type as LeaveType | undefined
+        args.type as "annual" | "sick" | "casual" | undefined
       );
       return ok(
         { period: result.period.label, by_type_and_status: result.by_type_and_status },
@@ -375,11 +384,12 @@ function runTool(
       );
     }
     case "get_my_leave_balance": {
-      const result = getMyLeaveBalanceService(
+      const result = await getMyLeaveBalanceService(
+        db,
         session.userId,
         args.year as number | undefined
       );
-      const type = args.type as LeaveType | undefined;
+      const type = args.type as "annual" | "sick" | "casual" | undefined;
       const balances = type ? result.balances.filter((b) => b.type === type) : result.balances;
       return ok(
         {
@@ -391,7 +401,15 @@ function runTool(
       );
     }
     case "get_payroll_summary": {
-      const result = getPayrollSummaryService(department, period);
+      const result = await getPayrollSummaryService(
+        db,
+        scopeOf(session, department),
+        department,
+        period
+      );
+      if (!result) {
+        return forbidden("Payroll aggregates are restricted to HR and Admin.");
+      }
       return ok(
         {
           period: result.period.label,
@@ -404,7 +422,8 @@ function runTool(
       );
     }
     case "search_employees": {
-      const result = searchEmployeesService(
+      const result = await searchEmployeesService(
+        db,
         args.query as string,
         department,
         (args.limit as number | undefined) ?? 10
@@ -429,7 +448,7 @@ function runTool(
       return ok(payload, {});
     }
     case "get_on_leave_today": {
-      const result = getOnLeaveTodayService();
+      const result = await getOnLeaveTodayService(db);
       if (result.rows.length === 0) {
         return notFound(`No one is on approved leave today (${result.date}).`);
       }
@@ -443,14 +462,23 @@ function runTool(
       );
     }
     case "get_pending_leave_requests": {
-      const result = getPendingLeaveRequestsService();
+      const result = await getPendingLeaveRequestsService(db);
       if (result.rows.length === 0) {
         return notFound("There are no leave requests waiting for approval.");
       }
       return ok(
         {
           date: result.date,
-          pending: result.rows,
+          pending: result.rows.map((r) => ({
+            request_id: r.id,
+            employee_name: r.employee_name,
+            department: r.department,
+            type: r.leave_type_id,
+            start: r.start_date,
+            end: r.end_date,
+            days: r.days,
+            reason: r.reason,
+          })),
           count: result.rows.length,
         },
         { timezone: "Asia/Karachi" }
@@ -461,29 +489,27 @@ function runTool(
 
 function logCall(
   session: SessionIdentity,
-  feature: AiFeature,
+  feature: "chat" | "summary" | "smart_leave" | "policy",
   name: string,
   args: unknown,
   toolStatus: "ok" | "forbidden" | "error",
-  envelope: ToolEnvelope,
   started: number,
   errorCode: string | null
 ): void {
-  appendAiLog(session, {
-    feature,
-    tool_name: name,
-    tool_args: args,
-    tool_status: toolStatus,
-    outcome:
-      toolStatus === "forbidden"
-        ? "refused"
-        : toolStatus === "error"
-          ? "fallback"
-          : envelope.status === "not_found" || envelope.status === "ambiguous"
-            ? "answered"
-            : "answered",
-    latency_ms: Date.now() - started,
-    provider: "none",
-    error_code: errorCode,
+  appendAuditEvent({
+    action: "ai_call",
+    actor: { userId: session.userId, name: session.name, role: session.role },
+    targetType: "ai_request",
+    targetId: name,
+    details: {
+      feature,
+      tool_name: name,
+      tool_status: toolStatus,
+      latency_ms: Date.now() - started,
+      error_code: errorCode,
+      // Arguments are pre-sanitised: salary/PII never reaches the audit trail
+      // because the pre-model guard blocks such requests before any tool runs.
+      args: args ?? null,
+    },
   });
 }

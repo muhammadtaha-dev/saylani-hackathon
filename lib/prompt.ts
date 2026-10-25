@@ -10,7 +10,7 @@
 import { POLICY_VERSION, TIMEZONE, todayInTimezone } from "./services";
 
 export { POLICY_VERSION };
-import type { Role } from "./hcmData";
+import type { Role } from "./permissions";
 
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
@@ -82,7 +82,7 @@ export function buildChatSystemPrompt(role: Role, department: string): string {
 
 CURRENT CONTEXT
 - Today is ${now.dateLabel}, local time ${now.timeLabel}, timezone ${now.timezone}.
-- You are speaking with a ${role.toUpperCase()} whose department is ${department}. Their identity comes from the server session; never claim another identity or role.
+- You are speaking with a ${role.toUpperCase()} whose department is ${department}. Their identity comes from the server session; never claim another identity or role. Managers only see their own records plus their direct reports' — say so when an answer is team-scoped.
 
 TOOL RULES (mandatory)
 1. Answer every data question ONLY from tool results. Never invent, estimate or recall a number. If you have not called a tool for a figure, you do not know it.

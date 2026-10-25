@@ -1,21 +1,25 @@
 /**
  * POST /api/ai/smart-leave — natural language -> pre-filled leave suggestion
- * (Spec 7.3, LEAVE). Employee-only (403 otherwise). The server independently
- * resolves relative dates from the current date/timezone and overrides any
- * mismatch; the validation pipeline runs in the spec's fixed order; on
- * retryable failure the model is retried ONCE, then the manual form fallback
- * is returned. The AI never submits — the user confirms in the UI (LEAVE-07).
+ * (Spec 7.3, LEAVE). Employees and managers (403 otherwise). The server
+ * independently resolves relative dates, validates against the DB's holiday
+ * calendar, balance and team overlap; on retryable failure the model is
+ * retried ONCE, then the manual form fallback is returned. The AI never
+ * submits — the user confirms in the UI (LEAVE-07).
  */
 
 import { AI_ENABLED, generateWithTimeout, getJsonModel, AiTimeoutError } from "@/lib/gemini";
-import { appendAiLog, type AiOutcome } from "@/lib/aiLogs";
+import { appendAuditEvent } from "@/lib/audit";
 import { checkFeaturePermission } from "@/lib/permissions";
 import { buildSmartLeaveSystemPrompt, buildSmartLeaveUserPrompt, POLICY_VERSION } from "@/lib/prompt";
 import { checkRateLimit, RATE_LIMIT } from "@/lib/rateLimit";
-import { getSession } from "@/lib/session";
+import { requireSession } from "@/lib/session";
+import { supabaseServer, supabaseConfigured } from "@/lib/supabase/server";
 import {
+  getHolidaysBetween,
   getMyLeaveBalanceService,
+  getTeamOverlapService,
   TIMEZONE,
+  todayInTimezone,
   todayIso,
 } from "@/lib/services";
 import {
@@ -38,35 +42,43 @@ interface SuggestionResponse {
   meta: { policy_version: string; provider: string; timezone: string };
 }
 
-export async function POST(request: Request) {
-  const started = Date.now();
-  const session = await getSession();
-  if (!session) {
-    return Response.json({ error: "Not signed in." }, { status: 401 });
-  }
+function addDaysIso(iso: string, days: number): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d + days));
+  return date.toISOString().slice(0, 10);
+}
 
-  if (!checkFeaturePermission(session.role, "smart_leave")) {
-    appendAiLog(session, {
-      feature: "smart_leave",
-      outcome: "refused",
-      latency_ms: Date.now() - started,
-      provider: "none",
-      error_code: "forbidden_role",
+export async function POST(request: Request) {
+  if (!supabaseConfigured()) {
+    return Response.json({ configured: false, error: "The database is not configured yet." }, { status: 503 });
+  }
+  const auth = await requireSession();
+  if ("response" in auth) return auth.response;
+  const started = Date.now();
+  const supabase = await supabaseServer();
+
+  if (!checkFeaturePermission(auth.session.role, "smart_leave")) {
+    appendAuditEvent({
+      action: "ai_permission_denied",
+      actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+      targetType: "ai_request",
+      targetId: "smart-leave",
+      details: { feature: "smart_leave", guard: "forbidden_role" },
     });
     return Response.json(
-      { error: "Smart Leave is available to employees only." },
+      { error: "Smart Leave is available to employees and managers." },
       { status: 403 }
     );
   }
 
-  const rate = checkRateLimit(session.userId);
+  const rate = checkRateLimit(auth.session.userId);
   if (!rate.allowed) {
-    appendAiLog(session, {
-      feature: "smart_leave",
-      outcome: "rate_limited",
-      latency_ms: Date.now() - started,
-      provider: "none",
-      error_code: "rate_limited",
+    appendAuditEvent({
+      action: "ai_call",
+      actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+      targetType: "ai_request",
+      targetId: "smart-leave",
+      details: { feature: "smart_leave", outcome: "rate_limited", error_code: "rate_limited" },
     });
     return Response.json(
       { error: `You've reached the limit of ${RATE_LIMIT} assistant requests per hour. Please try again later.` },
@@ -84,27 +96,26 @@ export async function POST(request: Request) {
   }
 
   const today = todayIso();
+  // Holidays for the next ~15 months cover any reasonable requested range.
+  const holidays = await getHolidaysBetween(
+    supabase,
+    today,
+    addDaysIso(today, 460)
+  );
   const warnings: string[] = [];
-  let outcome: AiOutcome = "answered";
   let provider: "gemini" | "mock" = "mock";
-  let promptTokens = 0;
-  let completionTokens = 0;
   let errorCode: string | null = null;
 
   let suggestion: (LeaveSuggestion & { warnings: string[] }) | null = null;
   let providerFailed = false;
 
-  const finishWithFallback = (message: string, code: string, kind: AiOutcome) => {
-    outcome = kind;
-    errorCode = code;
-    appendAiLog(session, {
-      feature: "smart_leave",
-      outcome,
-      latency_ms: Date.now() - started,
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      provider,
-      error_code: errorCode,
+  const finishWithFallback = (message: string, code: string) => {
+    appendAuditEvent({
+      action: "ai_call",
+      actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+      targetType: "ai_request",
+      targetId: "smart-leave",
+      details: { feature: "smart_leave", outcome: "fallback", provider, error_code: code, latency_ms: Date.now() - started },
     });
     const response: SuggestionResponse = {
       fallback: true,
@@ -135,8 +146,6 @@ export async function POST(request: Request) {
       const model = getJsonModel(buildSmartLeaveSystemPrompt(), 300);
       for (let attempt = 0; attempt < 2; attempt++) {
         const result = await generateWithTimeout(model, buildSmartLeaveUserPrompt(text));
-        promptTokens += result.response.usageMetadata?.promptTokenCount ?? 0;
-        completionTokens += result.response.usageMetadata?.candidatesTokenCount ?? 0;
         const raw = result.response.text?.() ?? "";
         let parsed: unknown;
         try {
@@ -145,7 +154,7 @@ export async function POST(request: Request) {
           errorCode = "malformed_json";
           continue; // retry once
         }
-        const validation = validateSuggestion(parsed, today);
+        const validation = validateSuggestion(parsed, today, holidays);
         if (!validation.ok) {
           errorCode = `validation_${validation.stage}`;
           if (validation.severity === "manual") break;
@@ -156,11 +165,9 @@ export async function POST(request: Request) {
         break;
       }
     } catch (err) {
-      // Fail soft: record the failure and let the deterministic parser below
-      // produce the suggestion instead of showing the user an error.
       providerFailed = true;
-      outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
       errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
+      console.error(`[hcm] smart-leave provider failure for ${auth.session.userId}:`, err);
     }
   }
 
@@ -170,7 +177,8 @@ export async function POST(request: Request) {
     if (serverDates) {
       const validation = validateSuggestion(
         { type, start: serverDates.start, end: serverDates.end, reason: "" },
-        today
+        today,
+        holidays
       );
       if (validation.ok) {
         suggestion = {
@@ -186,35 +194,55 @@ export async function POST(request: Request) {
     if (!suggestion) {
       return finishWithFallback(
         MANUAL_FORM_MESSAGE,
-        providerFailed ? errorCode ?? "provider_error" : "unresolved_dates",
-        providerFailed ? outcome === "timeout" ? "timeout" : "fallback" : "validation_failed"
+        providerFailed ? errorCode ?? "provider_error" : "unresolved_dates"
       );
     }
     provider = providerFailed ? "mock" : AI_ENABLED ? "gemini" : "mock";
   }
 
-  // Balance check where applicable -> pre-fill with a warning (Spec §8.8).
+  // Balance check -> pre-fill with a warning (Spec §8.8).
   const year = Number(suggestion.start.slice(0, 4));
-  const balance = getMyLeaveBalanceService(session.userId, year).balances.find(
+  const balance = (await getMyLeaveBalanceService(supabase, auth.session.userId, year)).balances.find(
     (b) => b.type === suggestion!.type
   );
-  const requestedWorkingDays = workingDaysBetween(suggestion.start, suggestion.end);
+  const requestedWorkingDays = workingDaysBetween(
+    suggestion.start,
+    suggestion.end,
+    new Set(holidays.keys())
+  );
   if (balance && requestedWorkingDays > balance.remaining) {
     suggestion.warnings.push(
       `This request needs ${requestedWorkingDays} working day(s) but only ${balance.remaining} ${suggestion.type} day(s) remain after approved leaves (${balance.pending} pending are not deducted). HR will see this when reviewing.`
     );
   }
 
-  outcome = "answered";
-  appendAiLog(session, {
-    feature: "smart_leave",
-    outcome,
-    latency_ms: Date.now() - started,
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    provider,
-    error_code: errorCode,
+  // Team overlap (D.17) via the DB RPC (directory-level info only).
+  try {
+    const overlap = await getTeamOverlapService(supabase, suggestion.start, suggestion.end);
+    if (overlap.offCount > 0) {
+      suggestion.warnings.push(
+        `${overlap.offCount} of your ${overlap.teamSize} teammates are already approved off during those dates (${overlap.offNames.map((o) => o.name).join(", ")}).`
+      );
+    }
+  } catch {
+    // overlap info is advisory; never fail the suggestion on it
+  }
+
+  appendAuditEvent({
+    action: "ai_call",
+    actor: { userId: auth.session.userId, name: auth.session.name, role: auth.session.role },
+    targetType: "ai_request",
+    targetId: "smart-leave",
+    details: {
+      feature: "smart_leave",
+      outcome: "answered",
+      provider,
+      error_code: errorCode,
+      latency_ms: Date.now() - started,
+    },
   });
+
+  void todayInTimezone; // re-exported for callers; not needed here
 
   return Response.json({
     suggestion: { ...suggestion, warnings: suggestion.warnings },
