@@ -9,6 +9,8 @@
  */
 
 import { TIMEZONE, todayInTimezone } from "./services";
+import { holidayName, isPublicHoliday } from "./holidays";
+import { EMPLOYEES, LEAVE_REQUESTS, type LeaveType } from "./hcmData";
 
 export type SmartLeaveType = "annual" | "sick" | "casual";
 
@@ -60,14 +62,14 @@ export function weekdayOf(iso: string): number {
   return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
 }
 
-/** Count Mon-Fri days in the inclusive range. */
+/** Count Mon–Fri non-holiday days in the inclusive range. */
 export function workingDaysBetween(start: string, end: string): number {
   if (!isValidIsoDate(start) || !isValidIsoDate(end) || start > end) return 0;
   let count = 0;
   let cursor = start;
   while (cursor <= end) {
     const wd = weekdayOf(cursor);
-    if (wd !== 0 && wd !== 6) count++;
+    if (wd !== 0 && wd !== 6 && !isPublicHoliday(cursor)) count++;
     cursor = addDays(cursor, 1);
   }
   return count;
@@ -231,12 +233,17 @@ export function validateSuggestion(
     warnings.push("Start date is in the past; the range was kept as requested for HR review.");
   }
 
-  // 7. Weekend handling — pre-fill with a note.
+  // 7. Weekend and public-holiday handling — pre-fill with a note.
   const weekendDays: string[] = [];
+  const holidayDays: string[] = [];
   let cursor = start;
   while (cursor <= end) {
     const wd = weekdayOf(cursor);
     if (wd === 0 || wd === 6) weekendDays.push(cursor);
+    else {
+      const holiday = holidayName(cursor);
+      if (holiday) holidayDays.push(`${cursor} (${holiday})`);
+    }
     cursor = addDays(cursor, 1);
   }
   if (weekendDays.length > 0) {
@@ -244,8 +251,15 @@ export function validateSuggestion(
       `${weekendDays.length} weekend day(s) inside the range are not counted as leave days.`
     );
   }
+  if (holidayDays.length > 0) {
+    warnings.push(
+      `${holidayDays.length} public holiday(s) inside the range are not counted as leave days: ${holidayDays.join(", ")}.`
+    );
+  }
   if (weekdayOf(start) === 0 || weekdayOf(start) === 6) {
     warnings.push("The start date falls on a weekend.");
+  } else if (isPublicHoliday(start)) {
+    warnings.push(`The start date is a public holiday (${holidayName(start)}).`);
   }
 
   return { ok: true, warnings };
@@ -264,3 +278,71 @@ export function formatSuggestion(
 }
 
 export { TIMEZONE };
+
+// ---------------------------------------------------------------------------
+// Smart suggestions (Checklist D.17): overlap warnings and a plain-language
+// risk explanation, computed from the same data the dashboard and the AI use.
+// ---------------------------------------------------------------------------
+
+export interface TeamOverlap {
+  teamSize: number;
+  offCount: number;
+  offNames: { name: string; type: string; dates: string }[];
+}
+
+/** Teammates (same department) with APPROVED leave overlapping the range. */
+export function teamOverlapFor(
+  userId: string,
+  start: string,
+  end: string
+): TeamOverlap {
+  const me = EMPLOYEES.find((e) => e.id === userId);
+  const department = me?.department;
+  const teammates = EMPLOYEES.filter(
+    (e) => e.department === department && e.status === "active" && e.id !== userId
+  );
+  const offNames: TeamOverlap["offNames"] = [];
+  for (const lr of LEAVE_REQUESTS) {
+    if (lr.status !== "approved") continue;
+    if (lr.start > end || lr.end < start) continue;
+    const person = teammates.find((e) => e.id === lr.employeeId);
+    if (!person) continue;
+    offNames.push({
+      name: person.name,
+      type: lr.type,
+      dates: `${lr.start} → ${lr.end}`,
+    });
+  }
+  return { teamSize: teammates.length, offCount: offNames.length, offNames };
+}
+
+/**
+ * Plain-language approval-likelihood note (Checklist D.17): balance,
+ * conflicts and holidays factored in. Deliberately advisory — HR decides.
+ */
+export function approvalRiskNote(options: {
+  type: LeaveType;
+  requestedWorkingDays: number;
+  remaining: number;
+  pendingDays: number;
+  overlap: TeamOverlap;
+}): string {
+  const parts: string[] = [];
+  const { type, requestedWorkingDays, remaining, pendingDays, overlap } = options;
+  if (requestedWorkingDays > remaining) {
+    parts.push(
+      `this request exceeds your remaining ${type} balance (${requestedWorkingDays} needed, ${remaining} left), so HR will likely reject it or ask you to change it`
+    );
+  }
+  if (overlap.offCount > 0) {
+    parts.push(
+      `${overlap.offCount} of your ${overlap.teamSize} teammates are already approved off during this window (${overlap.offNames.map((o) => o.name).join(", ")})${overlap.offCount >= 3 ? " — approvals get harder when the team is stretched thin" : ""}`
+    );
+  }
+  if (parts.length === 0) {
+    return pendingDays > 0
+      ? `Looks reasonable: enough ${type} balance remains and no teammates are off during those dates (you do have ${pendingDays} pending day(s) awaiting a decision).`
+      : `Looks reasonable: enough ${type} balance remains and no teammates are off during those dates, so it is likely to be approved.`;
+  }
+  return `Heads-up: ${parts.join("; ")}.`;
+}

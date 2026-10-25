@@ -17,9 +17,11 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
   const [notice, setNotice] = useState<{ tone: "error" | "info" | "success"; text: string } | null>(null);
   const [form, setForm] = useState({ type: "casual", start: "", end: "", reason: "" });
   const [submitting, setSubmitting] = useState(false);
+  const [riskNote, setRiskNote] = useState<string | null>(null);
 
   function resetForm() {
     setAiSuggested(false);
+    setRiskNote(null);
     setForm({ type: "casual", start: "", end: "", reason: "" });
   }
 
@@ -53,6 +55,7 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
       const s = data.suggestion;
       setForm({ type: s.type, start: s.start, end: s.end, reason: s.reason });
       setAiSuggested(true);
+      setRiskNote(null);
       setNotice(
         s.warnings && s.warnings.length > 0
           ? { tone: "info", text: s.warnings.join(" ") }
@@ -76,7 +79,12 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),
       });
-      const data = (await res.json()) as { error?: string; request?: { id: string } };
+      const data = (await res.json()) as {
+        request?: { id: string };
+        warnings?: string[];
+        risk_note?: string;
+        error?: string;
+      };
       if (!res.ok) {
         setNotice({ tone: "error", text: data.error ?? "Could not submit the leave request." });
         return;
@@ -85,6 +93,7 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
         tone: "success",
         text: `Leave request ${data.request?.id ?? ""} submitted — it is now pending approval by HR.`,
       });
+      setRiskNote(data.risk_note ?? null);
       setDescription("");
       resetForm();
       onSubmitted();
@@ -143,6 +152,16 @@ export function SmartLeave({ onSubmitted }: { onSubmitted: () => void }) {
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
           )}
           {notice.text}
+        </p>
+      )}
+
+      {riskNote && !notice && (
+        <p className="mt-3 flex items-start gap-2 rounded-lg bg-sky-50 p-3 text-sm text-sky-800 ring-1 ring-sky-200" role="status">
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <span>
+            <strong>Approval outlook: </strong>
+            {riskNote}
+          </span>
         </p>
       )}
 

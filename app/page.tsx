@@ -14,7 +14,7 @@ import { AuditModal } from "@/components/audit-modal";
 import { ChatDrawer } from "@/components/chat-drawer";
 import { HrOperations } from "@/components/hr-operations";
 import { KpiGrid } from "@/components/kpi-grid";
-import { MyDashboard } from "@/components/my-dashboard";
+import { MyActivity, MyDashboard } from "@/components/my-dashboard";
 import { SmartLeave } from "@/components/smart-leave";
 import { SummaryPanel } from "@/components/summary-panel";
 import { TeamManagement } from "@/components/team-management";
@@ -38,6 +38,7 @@ export default function Home() {
   const [aiModel, setAiModel] = useState<string>("");
   const [auditOpen, setAuditOpen] = useState(false);
   const [booting, setBooting] = useState(true);
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
 
   const goToLogin = useCallback(() => router.replace("/login"), [router]);
 
@@ -48,13 +49,18 @@ export default function Home() {
       goToLogin();
       return;
     }
-    if (!res.ok) return;
+    if (!res.ok) {
+      // Surface the failure instead of silently keeping stale numbers (B.5).
+      setDashboardError("Could not refresh the dashboard. Your last loaded figures may be stale — please retry.");
+      return;
+    }
     const data = (await res.json()) as {
       role: string;
       kpis?: DashboardKpis;
       my?: MySnapshot;
       ai?: { enabled: boolean; model: string };
     };
+    setDashboardError(null);
     setKpis(data.kpis ?? null);
     setMySnapshot(data.my ?? null);
     if (data.ai) {
@@ -87,6 +93,10 @@ export default function Home() {
   async function logOut() {
     await fetch("/api/auth/logout", { method: "POST" });
     goToLogin();
+  }
+
+  function reloadAll() {
+    void loadDashboard(department);
   }
 
   const providerLabel = aiEnabled ? `Gemini (${aiModel})` : "Grounded mock · no API key";
@@ -124,7 +134,7 @@ export default function Home() {
             <Database className="h-3.5 w-3.5 text-emerald-600" aria-hidden />
             {providerLabel}
           </span>
-          {session.role === "admin" && (
+          {session.role === "admin" || session.role === "hr" ? (
             <button
               type="button"
               onClick={() => setAuditOpen(true)}
@@ -133,7 +143,7 @@ export default function Home() {
               <ScrollText className="h-3.5 w-3.5" aria-hidden />
               Audit trail
             </button>
-          )}
+          ) : null}
           <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
             <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ring-1 ${ROLE_BADGE_CLASSES[session.role]}`}>
               {ROLE_LABELS[session.role]}
@@ -168,6 +178,18 @@ export default function Home() {
 
       {/* Dashboard */}
       <div className="mt-4 space-y-4">
+        {dashboardError && (
+          <p className="flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800" role="alert">
+            {dashboardError}
+            <button
+              type="button"
+              onClick={reloadAll}
+              className="shrink-0 rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-100"
+            >
+              Retry
+            </button>
+          </p>
+        )}
         {canSeeSummary && kpis && (
           <>
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -198,8 +220,9 @@ export default function Home() {
         {isEmployee && mySnapshot && (
           <>
             <h2 className="text-sm font-semibold text-slate-900">My workspace</h2>
-            <MyDashboard snapshot={mySnapshot} />
-            <SmartLeave onSubmitted={() => loadDashboard(department)} />
+            <MyDashboard snapshot={mySnapshot} onRequestsChanged={reloadAll} />
+            <SmartLeave onSubmitted={reloadAll} />
+            <MyActivity />
           </>
         )}
 
@@ -221,9 +244,9 @@ export default function Home() {
       </footer>
 
       {session && (
-        <ChatDrawer role={session.role} providerLabel={providerLabel} />
+        <ChatDrawer userId={session.userId} role={session.role} providerLabel={providerLabel} />
       )}
-      <AuditModal open={auditOpen} onClose={() => setAuditOpen(false)} />
+      <AuditModal open={auditOpen} onClose={() => setAuditOpen(false)} role={session.role} />
     </main>
   );
 }

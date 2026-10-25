@@ -14,7 +14,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 
-const STATE_DIR = path.join(process.cwd(), ".data");
+const STATE_DIR =
+  process.env.HCM_STATE_DIR ?? path.join(process.cwd(), ".data");
 const STATE_FILE = path.join(STATE_DIR, "state.json");
 const ENABLED = process.env.VERCEL !== "1";
 

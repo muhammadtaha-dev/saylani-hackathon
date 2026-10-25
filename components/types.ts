@@ -68,6 +68,38 @@ export interface ChatMessage {
   toolsUsed?: string[];
   refused?: boolean;
   provider?: string;
+  /** ISO-ish date label the answer was grounded in (source line). */
+  answeredAt?: string;
+  /** Set when the request failed — offers a Retry action. */
+  failed?: boolean;
+  /** The user text that produced this assistant message (for Retry). */
+  retryOf?: string;
+}
+
+export interface AuditEventClient {
+  seq: number;
+  id: string;
+  ts: string;
+  actor_name: string;
+  actor_id: string;
+  actor_role: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  ip: string;
+  before: Record<string, unknown> | null;
+  after: Record<string, unknown> | null;
+  details: Record<string, unknown> | null;
+  prev_hash: string;
+  hash: string;
+}
+
+export interface ChainVerificationClient {
+  ok: boolean;
+  checked: number;
+  total_rows: number;
+  broken_at_seq?: number;
+  reason?: string;
 }
 
 export interface AiLogRowClient {

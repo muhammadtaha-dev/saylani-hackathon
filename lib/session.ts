@@ -7,14 +7,39 @@
  * validation immediately, so removing a user logs them out everywhere.
  */
 
-import { createHmac } from "crypto";
+import { createHmac, randomBytes } from "crypto";
 import { cookies } from "next/headers";
 import { findEmployeeById } from "./hcmData";
 import type { SessionIdentity } from "./permissions";
 
 export const SESSION_COOKIE = "hcm_session";
-const SECRET = process.env.SESSION_SECRET ?? "hcm-lite-demo-signing-secret";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * Session-signing secret. Precedence:
+ *  1. SESSION_SECRET env var (the supported production setup).
+ *  2. A random per-process secret — never a value committed to the repo.
+ *
+ * A fixed fallback secret in source would let anyone forge an admin session
+ * cookie (verified against the production deployment during the Loop 1
+ * audit), so it was removed. Without SESSION_SECRET set, sessions survive
+ * while the process is warm and are invalidated when it restarts — set
+ * SESSION_SECRET in the environment for stable sessions.
+ */
+function resolveSecret(): string {
+  const fromEnv = process.env.SESSION_SECRET?.trim();
+  if (fromEnv) return fromEnv;
+  if (!resolveSecret.warned) {
+    resolveSecret.warned = true;
+    console.warn(
+      "[hcm] SESSION_SECRET is not set — using a random per-process signing secret. " +
+        "Sessions will not survive server restarts; set SESSION_SECRET to fix."
+    );
+  }
+  return randomBytes(32).toString("hex");
+}
+resolveSecret.warned = false;
+const SECRET = resolveSecret();
 
 function sign(payload: string): string {
   return createHmac("sha256", SECRET).update(payload).digest("hex").slice(0, 32);

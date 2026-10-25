@@ -15,6 +15,8 @@ Assistant Module M8).
 npm install
 npm run dev        # http://localhost:3000
 npm run build      # zero TypeScript/lint errors, production build
+npm test           # unit tests (leave balance, permissions, smart leave, audit chain)
+npm run e2e        # end-to-end tests against a running server (E2E_URL to override)
 ```
 
 Optional — real AI answers:
@@ -45,10 +47,39 @@ The app is behind real authentication:
   soft delete — the user is signed out instantly and can no longer log in.
 - **HR Operations panel** (Admin/HR): process leave requests like a real HR
   desk — approve/reject pending requests (approval instantly updates the
-  employee's remaining balance), plus **Late Comers** ranking and a
-  **per-employee attendance report** for the month, all from the shared
-  service layer so the numbers reconcile with the dashboard and the AI.
-- Only Admin can read the AI audit trail; employees never see org-wide data.
+  employee's remaining balance; **rejection requires a comment**), plus
+  **Late Comers** ranking and a **per-employee attendance report** for the
+  month, all from the shared service layer so the numbers reconcile with the
+  dashboard and the AI.
+- **Audit trail** (Audit trail button): Admin/HR see the unified
+  hash-chained event log — logins (success/failure), logouts, user
+  creation/removal, leave submit/approve/reject/cancel and AI permission
+  denials, each with who, what, when, IP and before/after values. Filters by
+  user/action/date, **CSV export**, and a **Verify integrity** button that
+  recomputes the chain and reports any tampering. Employees see only their
+  own entries (My activity card).
+
+## Smart Leave
+
+- Plain-language input → AI pre-filled form (marked **AI-suggested**) → the
+  user confirms through the standard validation endpoint. The AI never submits.
+- Server-side validation: past dates, end-before-start, weekends, **Pakistan
+  public holidays 2026** (`lib/holidays.ts`), overlap with existing requests
+  and **insufficient balance** — weekends and holidays do not consume quota.
+- **Smart suggestions**: team-overlap warning ("2 of 5 teammates already
+  approved off during those dates") and a plain-language approval-outlook
+  note (balance + conflicts).
+- **Cancellation**: employees can cancel a pending request any time, or an
+  approved request up to the day before it starts — quota is released
+  automatically and the action is audit-logged.
+- **Chat** persists per user (localStorage) with a **New chat** button, a
+  typing indicator, **Retry** on failed answers and role-scoped quick chips:
+  "My leave balance", "Who is off today", "Apply for leave" (employee) /
+  "Pending approvals" (Admin/HR). Answers show their source (tools used +
+  date) and the mandatory **AI-generated** label.
+- **English & Urdu**: the assistant replies in the user's language — Urdu
+  script and Roman Urdu input are understood (real model via prompt rules;
+  grounded mock carries Urdu templates for the main intents and refusals).
 
 Demo credentials (shown on the login page — click an account to fill the form):
 
@@ -71,19 +102,22 @@ authentication.
 
 ```
 Browser (app/page.tsx + components/*)
-  │  fetches ONLY internal routes (/api/ai/*, /api/dashboard, /api/leaves, /api/session)
+  │  fetches ONLY internal routes (/api/ai/*, /api/dashboard, /api/leaves, /api/audit, /api/session)
   ▼
 API routes (app/api/**)  ── session identity, rate limit, input limits, guard
   │
   ├─ lib/permissions.ts   role × tool × arguments matrix + pre-model guard (salary/injection)
-  ├─ lib/tools.ts         7-tool registry, strict zod schemas, common envelope, per-call logging
+  ├─ lib/tools.ts         9-tool registry, strict zod schemas, common envelope, per-call logging
   ├─ lib/services.ts      THE single source of truth: definitions + metrics (dashboard == AI)
   ├─ lib/hcmData.ts       seeded data (17 employees, attendance, leaves, salaries never leave)
-  ├─ lib/gemini.ts        Gemini 1.5 Flash client, 15 s timeout, no blind retries
-  ├─ lib/mockAssistant.ts grounded deterministic fallback (no key / provider down)
+  ├─ lib/gemini.ts        Gemini Flash client, 15 s timeout, no blind retries, key from env only
+  ├─ lib/mockAssistant.ts grounded deterministic fallback (no key / provider down), EN + UR
   ├─ lib/smartLeave.ts    server-side relative-date resolution + spec-ordered validation
-  ├─ lib/prompt.ts        versioned Section 3 policy rules, current date/timezone
+  ├─ lib/holidays.ts      Pakistan public holidays 2026 (quota-exempt, warned)
+  ├─ lib/prompt.ts        versioned Section 3 policy rules, current date/timezone, language rule
   ├─ lib/aiLogs.ts        append-only ai_logs with redaction (Admin-only read)
+  ├─ lib/audit.ts         unified append-only HASH-CHAINED audit trail (JSONL, verify endpoint)
+  ├─ lib/persistence.ts   local demo deltas (.data/state.json; HCM_STATE_DIR to override)
   └─ lib/rateLimit.ts     20 requests / user / hour (HTTP 429)
 ```
 
@@ -149,15 +183,31 @@ configured, `AiTimeoutError` → friendly fallback + `outcome: timeout` log row.
 
 ## Known limitations (documented, per T10.3)
 
-- `ai_logs`, rate-limit counters, conversations and newly submitted leaves are
-  **in-memory per server instance** (Vercel serverless may reset them); this is a
-  demo-store tradeoff — the append-only + redaction behaviour is identical.
-- A deployment fallback **Gemini key is embedded in `lib/gemini.ts` at the
-  repository owner's explicit request** so the live Vercel demo works without
-  dashboard configuration (env vars always take precedence). It is rotated
-  easily and should be removed for any serious deployment.
+- Rate-limit counters, chat conversation memory and `ai_logs` are **in-memory
+  per server instance**; the unified **audit trail is an append-only JSONL
+  file** (`.data/audit.jsonl` locally, per-instance `/tmp` on Vercel). On
+  serverless these reset with the instance — a demo-store tradeoff; the
+  append-only + hash-chain behaviour is identical, and there is **no UPDATE
+  or DELETE code path for the audit store anywhere** (any external edit or
+  deletion is reported by Verify integrity).
 - Seed attendance covers March 2026 and October 2026; other periods answer
   plainly "no records found for that period" (which is itself a spec behaviour).
+- Islamic holiday dates in `lib/holidays.ts` are the expected 2026 dates,
+  subject to official moon sightings; update the file yearly.
+- Roles are **Admin / HR / Employee**. There is no separate "Manager" role —
+  approval duties live with HR, and no manager→reportee hierarchy is modelled.
+
+## Security notes (Loop-1 hardening)
+
+- **No secrets in source**: the previously committed fallback Gemini key and
+  the fixed session-signing secret were removed. Set `GEMINI_API_KEY` and
+  `SESSION_SECRET` in the environment. **Rotate any key that ever appeared in
+  git history** (the removed key was public in this repository).
+- Without `SESSION_SECRET` the app signs sessions with a random per-process
+  secret: secure, but sessions do not survive restarts (a warning is logged).
+- Login failures are generic (no account enumeration) and throttled per email.
+- Chat conversation memory is keyed per user, so conversation ids cannot leak
+  another user's context.
 
 ## Deploy on Vercel
 

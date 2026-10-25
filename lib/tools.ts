@@ -26,10 +26,13 @@ import {
   getLeaveSummaryService,
   getMyAttendanceSummaryService,
   getMyLeaveBalanceService,
+  getOnLeaveTodayService,
   getPayrollSummaryService,
+  getPendingLeaveRequestsService,
   searchEmployeesService,
 } from "./services";
 import { appendAiLog, type AiFeature } from "./aiLogs";
+import { appendAuditEvent } from "./audit";
 
 // ---------------------------------------------------------------------------
 // Common result envelope (Spec 6.1)
@@ -123,6 +126,8 @@ const ToolArgs = {
     department: departmentSchema.optional(),
     limit: z.number().int().min(1).max(10).optional(),
   }),
+  get_on_leave_today: z.object({}),
+  get_pending_leave_requests: z.object({}),
 } satisfies Record<ToolName, z.ZodTypeAny>;
 
 // ---------------------------------------------------------------------------
@@ -212,6 +217,18 @@ export const GEMINI_TOOL_DECLARATIONS = [
       limit: schemaNumber("Max matches, 1-10, default 10"),
     }),
   },
+  {
+    name: "get_on_leave_today",
+    description:
+      "Who is on approved leave today: names, department, leave type and date range. Use for 'who is off today' questions.",
+    parameters: schemaObject({}),
+  },
+  {
+    name: "get_pending_leave_requests",
+    description:
+      "The leave requests currently awaiting approval: employee, type, dates and reason. Admin/HR only.",
+    parameters: schemaObject({}),
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -253,6 +270,14 @@ export async function executeTool(
       "This request is not permitted for your role. The assistant cannot disclose it."
     );
     logCall(session, options.feature, name, args, "forbidden", envelope, started, "forbidden");
+    // Permission denials also land in the unified audit trail (Checklist E.22).
+    appendAuditEvent({
+      action: "ai_permission_denied",
+      actor: { userId: session.userId, name: session.name, role: session.role },
+      targetType: "ai_request",
+      targetId: name,
+      details: { feature: options.feature, args },
+    });
     return envelope;
   }
 
@@ -402,6 +427,34 @@ function runTool(
         };
       }
       return ok(payload, {});
+    }
+    case "get_on_leave_today": {
+      const result = getOnLeaveTodayService();
+      if (result.rows.length === 0) {
+        return notFound(`No one is on approved leave today (${result.date}).`);
+      }
+      return ok(
+        {
+          date: result.date,
+          on_leave: result.rows,
+          count: result.rows.length,
+        },
+        { timezone: "Asia/Karachi" }
+      );
+    }
+    case "get_pending_leave_requests": {
+      const result = getPendingLeaveRequestsService();
+      if (result.rows.length === 0) {
+        return notFound("There are no leave requests waiting for approval.");
+      }
+      return ok(
+        {
+          date: result.date,
+          pending: result.rows,
+          count: result.rows.length,
+        },
+        { timezone: "Asia/Karachi" }
+      );
     }
   }
 }

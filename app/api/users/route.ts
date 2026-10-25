@@ -22,6 +22,7 @@ import {
 } from "@/lib/hcmData";
 import { canListUsers, canManageUser } from "@/lib/permissions";
 import { getSession } from "@/lib/session";
+import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
 
 function safeUser(e: (typeof EMPLOYEES)[number]) {
   return {
@@ -100,6 +101,14 @@ export async function POST(request: Request) {
     department: department as DepartmentName,
     designation,
   });
+  appendAuditEvent({
+    action: "user_created",
+    actor: { userId: session.userId, name: session.name, role: session.role },
+    targetType: "user",
+    targetId: created.id,
+    ip: ipFromRequest(request),
+    after: { name: created.name, email: created.email, role: created.role, department: created.department, designation: created.designation, status: created.status },
+  });
   return Response.json({ user: safeUser(created) }, { status: 201 });
 }
 
@@ -128,6 +137,16 @@ export async function DELETE(request: Request) {
     );
   }
 
+  const before = { name: target.name, email: target.email, role: target.role, status: target.status };
   setEmployeeStatus(target.id, "inactive");
+  appendAuditEvent({
+    action: "user_removed",
+    actor: { userId: session.userId, name: session.name, role: session.role },
+    targetType: "user",
+    targetId: target.id,
+    ip: ipFromRequest(request),
+    before,
+    after: { status: "inactive" },
+  });
   return Response.json({ ok: true, id: target.id, status: "inactive" });
 }

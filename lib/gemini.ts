@@ -20,18 +20,14 @@ export const AI_TIMEOUT_MS = 15000;
 export const MAX_OUTPUT_TOKENS = 700;
 
 /**
- * Owner-provided deployment fallback key (explicitly approved for public
- * use by the repository owner for the hackathon demo; base64-encoded at the
- * owner's request so secret-scanning push protection does not block
- * deployment updates). Environment variables always take precedence —
- * rotate this key after judging.
+ * The API key comes ONLY from environment variables (GEMINI_API_KEY or
+ * AI_API_KEY). A previously committed base64-encoded fallback key was
+ * removed (Loop 1 audit): a secret in source is public the moment the repo
+ * is, and violates the "never hard-code secrets" ground rule. That key must
+ * be rotated in Google AI Studio. With no key configured the app runs the
+ * grounded mock assistant, which answers from the same tools.
  */
-const ENCODED_DEPLOYMENT_KEY =
-  "QVEuQWI4Uk42TGRWQ3lxQnN4UFRPY2R5d2NpRDBnVW5KRERxeHFYVFViYXdnSFVoLXEzUnc=";
-const DEPLOYMENT_FALLBACK_KEY = Buffer.from(ENCODED_DEPLOYMENT_KEY, "base64").toString("utf8");
-
-const API_KEY =
-  (process.env.GEMINI_API_KEY ?? process.env.AI_API_KEY ?? "").trim() || DEPLOYMENT_FALLBACK_KEY;
+const API_KEY = (process.env.GEMINI_API_KEY ?? process.env.AI_API_KEY ?? "").trim();
 
 /** False when no key is available at all — routes fall back to the grounded mock. */
 export const AI_ENABLED = API_KEY.length > 0;

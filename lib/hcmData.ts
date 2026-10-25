@@ -15,7 +15,7 @@ export type DepartmentName = "Engineering" | "Sales" | "HR";
 export type EmploymentStatus = "active" | "inactive";
 export type AttendanceStatus = "present" | "late" | "absent" | "leave";
 export type LeaveType = "annual" | "sick" | "casual";
-export type LeaveStatus = "pending" | "approved" | "rejected";
+export type LeaveStatus = "pending" | "approved" | "rejected" | "cancelled";
 
 export const DEPARTMENTS: DepartmentName[] = ["Engineering", "Sales", "HR"];
 
@@ -294,7 +294,7 @@ export const EMPLOYEES: Employee[] = [
 
 /**
  * Attendance seed. Two seeded months:
- *  - March 2026 (22 working days)
+ *  - March 2026 (21 working days — 23 March is Pakistan Day, a public holiday)
  *  - October 2026 (working days from Oct 1 up to the latest seeded day, Oct 23)
  * Everyone not listed here is "present" with a 09:00 check-in for those months.
  */
@@ -373,9 +373,9 @@ function buildMonthAttendance(
 }
 
 const MARCH_2026_WEEKDAYS = [
-  2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 23, 24, 25, 26, 27, 30,
+  2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 24, 25, 26, 27, 30,
   31,
-];
+]; // 23 March is Pakistan Day — a public holiday, so no attendance records.
 const OCTOBER_2026_WEEKDAYS = [
   1, 2, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23,
 ];
@@ -536,14 +536,16 @@ export function setEmployeeStatus(
   return employee;
 }
 
-/** Set a leave request's status (approve/reject) and persist the decision. */
+/** Set a leave request's status (approve/reject/cancel) and persist the decision. */
 export function setLeaveRequestStatus(
   id: string,
   status: LeaveStatus
 ): LeaveRequest | undefined {
   const leaveRequest = LEAVE_REQUESTS.find((lr) => lr.id === id);
   if (leaveRequest) leaveRequest.status = status;
-  if (!SEED_LEAVE_IDS.has(id)) leaveStatusOverrides[id] = status;
+  // Decisions persist for ALL requests, seeded ones included — losing an HR
+  // decision on restart is data loss (Loop 1 audit, item D.16).
+  leaveStatusOverrides[id] = status;
   persistState();
   return leaveRequest;
 }
@@ -551,7 +553,6 @@ export function setLeaveRequestStatus(
 // ---- Persistence: user/leave mutations survive server restarts -----------
 
 const SEED_EMPLOYEE_IDS = new Set(EMPLOYEES.map((e) => e.id));
-const SEED_LEAVE_IDS = new Set(LEAVE_REQUESTS.map((lr) => lr.id));
 
 const persisted = loadPersistedState();
 const addedEmployees = (persisted?.addedEmployees as Employee[] | undefined) ?? [];

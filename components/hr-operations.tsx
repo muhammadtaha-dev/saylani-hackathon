@@ -50,6 +50,7 @@ const STATUS_STYLES: Record<string, string> = {
   pending: "bg-amber-100 text-amber-700",
   approved: "bg-emerald-100 text-emerald-700",
   rejected: "bg-rose-100 text-rose-700",
+  cancelled: "bg-slate-200 text-slate-600",
 };
 
 /**
@@ -94,13 +95,23 @@ export function HrOperations({
   }, [load]);
 
   async function process(id: string, status: "approved" | "rejected") {
+    if (busyId) return;
+    let comment = "";
+    if (status === "rejected") {
+      // A rejection must carry a reason for the employee (Checklist D.18).
+      comment = window.prompt("Reason for rejection (shared with the employee):") ?? "";
+      if (comment.trim().length < 3) {
+        setNotice({ tone: "error", text: "A short comment is required to reject a request." });
+        return;
+      }
+    }
     setBusyId(id);
     setNotice(null);
     try {
       const res = await fetch("/api/leaves", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, status }),
+        body: JSON.stringify({ id, status, comment }),
       });
       const data = (await res.json()) as { error?: string; request?: LeaveRow; note?: string };
       if (!res.ok) {
@@ -271,7 +282,7 @@ export function HrOperations({
           </p>
           {overview && overview.late_comers.length === 0 ? (
             <p className="mt-3 rounded-lg bg-slate-50 p-4 text-sm text-slate-500">
-              No late arrivals recorded this month{department === "All" ? "" : ` in ${department}`} — sab parhaye likhaye hain!
+              No late arrivals recorded this month{department === "All" ? "" : ` in ${department}`} — everyone is arriving on time.
             </p>
           ) : (
             <table className="mt-3 w-full text-left text-sm">

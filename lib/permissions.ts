@@ -17,6 +17,8 @@ export const TOOL_NAMES = [
   "get_my_leave_balance",
   "get_payroll_summary",
   "search_employees",
+  "get_on_leave_today",
+  "get_pending_leave_requests",
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];
@@ -31,6 +33,11 @@ const TOOL_MATRIX: Record<ToolName, Record<Role, boolean>> = {
   get_my_leave_balance: { admin: true, hr: true, employee: true }, // own, no user parameter
   get_payroll_summary: { admin: true, hr: true, employee: false },
   search_employees: { admin: true, hr: true, employee: true }, // safe fields only
+  // Directory-level "who is away" — names and dates only, no personal details.
+  get_on_leave_today: { admin: true, hr: true, employee: true },
+  // The approval queue is an HR/Admin surface; employees are refused and the
+  // denial is audit-logged.
+  get_pending_leave_requests: { admin: true, hr: true, employee: false },
 };
 
 export interface SessionIdentity {
@@ -100,7 +107,7 @@ const AGGREGATE_HINTS =
   /\b(total|average|avg|sum|aggregate|aggregated|summary|cost|spend|spending|headcount|breakdown|overall)\b/i;
 
 const SENSITIVE_INDIVIDUAL =
-  /\b(salary|salaries|wage|wages|pay|paid|earnings|earning|compensation|cnic|bank account|bank details|account number)\b/i;
+  /\b(salary|salaries|wage|wages|pay|paid|earnings|earning|compensation|cnic|bank account|bank details|account number)\b|تنخواہ|تنخواه|tanq?wa|tankhwa|tankha/i;
 
 const INJECTION_PATTERNS: RegExp[] = [
   /ignore\s+(all\s+|your\s+|these\s+|any\s+|the\s+|previous\s+|above\s+)*(rules|instructions|prompts?|policies|restrictions|guardrails)/i,

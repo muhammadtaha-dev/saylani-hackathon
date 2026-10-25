@@ -1,8 +1,8 @@
 /**
  * Standard leave application endpoint (the "standard leave endpoint" the AI
  * must never call — LEAVE-07). Applies the same validation pipeline as the
- * Smart Leave pre-fill, plus balance and overlap checks, then records a
- * PENDING request for HR approval. The AI never writes anything.
+ * Smart Leave pre-fill, plus balance, holiday, weekend and overlap checks,
+ * then records a PENDING request for HR approval. The AI never writes anything.
  *
  * GET  /api/leaves — my requests (employee) or all requests (Admin/HR).
  * POST /api/leaves — { type, start, end, reason } -> pending leave request.
@@ -19,7 +19,8 @@ import {
 } from "@/lib/hcmData";
 import { getSession } from "@/lib/session";
 import { getMyLeaveBalanceService, todayIso } from "@/lib/services";
-import { isValidIsoDate, workingDaysBetween } from "@/lib/smartLeave";
+import { isValidIsoDate, workingDaysBetween, teamOverlapFor, approvalRiskNote } from "@/lib/smartLeave";
+import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
 
 const LEAVE_TYPE_SET: LeaveType[] = ["annual", "sick", "casual"];
 
@@ -90,11 +91,11 @@ export async function POST(request: Request) {
     );
   }
 
-  // Balance check (working days only — weekends are not leave days).
+  // Balance check (working days only — weekends and public holidays are not leave days).
   const days = workingDaysBetween(start, end);
   if (days <= 0) {
     return Response.json(
-      { error: "That range contains no working days (weekends are not counted)." },
+      { error: "That range contains no working days (weekends and public holidays are not counted)." },
       { status: 400 }
     );
   }
@@ -123,7 +124,32 @@ export async function POST(request: Request) {
   };
   addLeaveRequest(newRequest);
 
-  return Response.json({ request: newRequest }, { status: 201 });
+  appendAuditEvent({
+    action: "leave_submitted",
+    actor: { userId: session.userId, name: session.name, role: session.role },
+    targetType: "leave_request",
+    targetId: newRequest.id,
+    ip: ipFromRequest(request),
+    after: { ...newRequest },
+  });
+
+  // Smart suggestions (D.17): team-overlap warning + plain-language risk note.
+  const overlap = teamOverlapFor(session.userId, start, end);
+  const warnings: string[] = [];
+  if (overlap.offCount > 0) {
+    warnings.push(
+      `${overlap.offCount} of your ${overlap.teamSize} teammates are already approved off during those dates.`
+    );
+  }
+  const riskNote = approvalRiskNote({
+    type: type as LeaveType,
+    requestedWorkingDays: days,
+    remaining: balance?.remaining ?? 0,
+    pendingDays: balance?.pending ?? 0,
+    overlap,
+  });
+
+  return Response.json({ request: newRequest, warnings, risk_note: riskNote }, { status: 201 });
 }
 
 /**
@@ -131,6 +157,7 @@ export async function POST(request: Request) {
  * Approval updates the employee's balance automatically (only approved
  * leaves consume quota) and marks seeded attendance days as "leave" when
  * the range overlaps recorded working days. Employees cannot access this.
+ * Both decisions are appended to the audit trail with before/after values.
  */
 export async function PATCH(request: Request) {
   const session = await getSession();
@@ -145,12 +172,19 @@ export async function PATCH(request: Request) {
   }
 
   const body = (await request.json().catch(() => null)) as
-    | { id?: unknown; status?: unknown }
+    | { id?: unknown; status?: unknown; comment?: unknown }
     | null;
   const id = typeof body?.id === "string" ? body.id : "";
   const status = typeof body?.status === "string" ? (body.status as LeaveStatus) : "";
+  const comment = typeof body?.comment === "string" ? body.comment.trim().slice(0, 300) : "";
   if (!id || (status !== "approved" && status !== "rejected")) {
     return Response.json({ error: "Please provide a request id and status (approved/rejected)." }, { status: 400 });
+  }
+  if (status === "rejected" && comment.length < 3) {
+    return Response.json(
+      { error: "Please add a short comment so the employee knows why the request was rejected." },
+      { status: 400 }
+    );
   }
 
   const leaveRequest = LEAVE_REQUESTS.find((lr) => lr.id === id);
@@ -164,6 +198,7 @@ export async function PATCH(request: Request) {
     );
   }
 
+  const before = { ...leaveRequest };
   setLeaveRequestStatus(id, status);
 
   // Keep attendance consistent with the approved leave (seeded days only).
@@ -179,6 +214,17 @@ export async function PATCH(request: Request) {
       }
     }
   }
+
+  appendAuditEvent({
+    action: status === "approved" ? "leave_approved" : "leave_rejected",
+    actor: { userId: session.userId, name: session.name, role: session.role },
+    targetType: "leave_request",
+    targetId: id,
+    ip: ipFromRequest(request),
+    before,
+    after: { ...leaveRequest },
+    details: comment ? { comment } : null,
+  });
 
   const employee = findEmployeeById(leaveRequest.employeeId);
   return Response.json({

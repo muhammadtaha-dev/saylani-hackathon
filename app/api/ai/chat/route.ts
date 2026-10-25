@@ -19,10 +19,10 @@ import {
   AiTimeoutError,
 } from "@/lib/gemini";
 import { appendAiLog, type AiOutcome } from "@/lib/aiLogs";
+import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
 import {
   checkFeaturePermission,
   guardRequest,
-  GENERIC_REFUSAL,
   type SessionIdentity,
 } from "@/lib/permissions";
 import {
@@ -32,7 +32,7 @@ import {
   TOOL_ROUNDS_FALLBACK,
 } from "@/lib/prompt";
 import { checkRateLimit, RATE_LIMIT } from "@/lib/rateLimit";
-import { runMockAssistant } from "@/lib/mockAssistant";
+import { runMockAssistant, guardRefusalMessage } from "@/lib/mockAssistant";
 import { getSession } from "@/lib/session";
 import { executeTool } from "@/lib/tools";
 
@@ -44,6 +44,11 @@ interface StoredMessage {
   role: "user" | "model";
   text: string;
 }
+/**
+ * Conversation memory, keyed by USER and conversation id — never by the
+ * client-supplied conversation id alone (a shared id must not leak another
+ * user's history into someone else's model context).
+ */
 const conversations = new Map<string, StoredMessage[]>();
 
 const FALLBACK_TIMEOUT =
@@ -99,8 +104,16 @@ export async function POST(request: Request) {
       provider: "none",
       error_code: `guard_${guard.kind}`,
     });
+    appendAuditEvent({
+      action: "ai_permission_denied",
+      actor: { userId: session.userId, name: session.name, role: session.role },
+      targetType: "ai_request",
+      targetId: "chat",
+      ip: ipFromRequest(request),
+      details: { feature: "chat", guard: guard.kind },
+    });
     return Response.json({
-      answer: guard.message ?? GENERIC_REFUSAL,
+      answer: guardRefusalMessage(guard.kind ?? "sensitive_pii", message),
       ai_generated: true,
       refused: true,
       tools_used: [],
@@ -135,10 +148,12 @@ export async function POST(request: Request) {
       toolsUsed = mock.toolsUsed;
       feature = mock.feature === "policy" ? "policy" : "chat";
       provider = "mock";
+      if (mock.refused) outcome = "refused";
       completionTokens = Math.ceil(answer.length / 4);
     } else {
       provider = "gemini";
-      const history = (conversations.get(conversationId) ?? []).slice(-HISTORY_WINDOW);
+      const memoryKey = `${session.userId}:${conversationId}`;
+      const history = (conversations.get(memoryKey) ?? []).slice(-HISTORY_WINDOW);
       const contents: Array<{
         role: "user" | "model";
         parts: Array<
@@ -188,9 +203,11 @@ export async function POST(request: Request) {
     }
   } catch (err) {
     // Fail soft: on any provider failure, fall back to the grounded mock so
-    // the user still receives a real, database-backed answer.
+    // the user still receives a real, database-backed answer. The failure is
+    // logged server-side — silent fallbacks hide outages (Loop 1 audit).
     errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
     outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
+    console.error(`[hcm] AI provider failure for user ${session.userId}:`, err);
     try {
       const mock = await runMockAssistant(message, session);
       answer = mock.answer;
@@ -198,18 +215,20 @@ export async function POST(request: Request) {
       feature = mock.feature === "policy" ? "policy" : "chat";
       provider = "mock";
       fallbackUsed = true;
+      if (mock.refused) outcome = "refused";
     } catch {
       answer = err instanceof AiTimeoutError ? FALLBACK_TIMEOUT : FALLBACK_PROVIDER;
       provider = AI_ENABLED ? "gemini" : "mock";
     }
   }
 
-  // Conversation memory (windowed, server-side).
-  const memory = conversations.get(conversationId) ?? [];
+  // Conversation memory (windowed, server-side, per user).
+  const memoryKey = `${session.userId}:${conversationId}`;
+  const memory = conversations.get(memoryKey) ?? [];
   memory.push({ role: "user", text: message });
   memory.push({ role: "model", text: answer });
   while (memory.length > HISTORY_WINDOW) memory.shift();
-  conversations.set(conversationId, memory);
+  conversations.set(memoryKey, memory);
 
   const identity: SessionIdentity = session;
   appendAiLog(identity, {

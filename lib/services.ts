@@ -285,7 +285,12 @@ export function getLeaveSummaryService(
   const result = {} as LeaveSummaryResult["by_type_and_status"];
   for (const t of LEAVE_TYPES) {
     if (type && t !== type) continue;
-    result[t] = { approved: { requests: 0, days: 0 }, pending: { requests: 0, days: 0 }, rejected: { requests: 0, days: 0 } };
+    result[t] = {
+      approved: { requests: 0, days: 0 },
+      pending: { requests: 0, days: 0 },
+      rejected: { requests: 0, days: 0 },
+      cancelled: { requests: 0, days: 0 },
+    };
   }
   for (const lr of LEAVE_REQUESTS) {
     if (!inScope.has(lr.employeeId)) continue;
@@ -373,6 +378,82 @@ export interface EmployeeMatch {
   name: string;
   department: string;
   designation: string;
+}
+
+export interface OnLeaveTodayRow {
+  employee_id: string;
+  name: string;
+  department: string;
+  type: string;
+  start: string;
+  end: string;
+  days: number;
+}
+
+/**
+ * Names of people on APPROVED leave today (start <= today <= end).
+ * Directory-level information (who is away), not an individual's leave
+ * record — safe for every role; individual salary/PII is never included.
+ */
+export function getOnLeaveTodayService(): { date: string; rows: OnLeaveTodayRow[] } {
+  const today = todayIso();
+  const rows: OnLeaveTodayRow[] = [];
+  for (const lr of LEAVE_REQUESTS) {
+    if (lr.status !== "approved") continue;
+    if (lr.start > today || lr.end < today) continue;
+    const employee = EMPLOYEES.find((e) => e.id === lr.employeeId);
+    if (!employee || employee.status !== "active") continue;
+    rows.push({
+      employee_id: employee.id,
+      name: employee.name,
+      department: employee.department,
+      type: lr.type,
+      start: lr.start,
+      end: lr.end,
+      days: lr.days,
+    });
+  }
+  rows.sort((a, b) => a.department.localeCompare(b.department) || a.name.localeCompare(b.name));
+  return { date: today, rows };
+}
+
+export interface PendingLeaveRow {
+  request_id: string;
+  employee_id: string;
+  employee_name: string;
+  department: string;
+  type: LeaveType;
+  start: string;
+  end: string;
+  days: number;
+  reason: string;
+  applied_on: string;
+}
+
+/** All currently PENDING leave requests, oldest application first. */
+export function getPendingLeaveRequestsService(): {
+  date: string;
+  rows: PendingLeaveRow[];
+} {
+  const rows: PendingLeaveRow[] = [];
+  for (const lr of LEAVE_REQUESTS) {
+    if (lr.status !== "pending") continue;
+    const employee = EMPLOYEES.find((e) => e.id === lr.employeeId);
+    rows.push({
+      request_id: lr.id,
+      employee_id: lr.employeeId,
+      employee_name: employee?.name ?? lr.employeeId,
+      department: employee?.department ?? "",
+      type: lr.type,
+      start: lr.start,
+      end: lr.end,
+      days: lr.days,
+      reason: lr.reason,
+      applied_on: lr.appliedOn,
+    });
+  }
+  rows.sort((a, b) => a.applied_on.localeCompare(b.applied_on));
+  return { date: todayIso(), rows };
 }
 
 export interface SearchEmployeesResult {
