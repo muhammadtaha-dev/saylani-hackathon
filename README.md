@@ -43,6 +43,11 @@ The app is behind real authentication:
 - **Admin** adds/removes **HR and Employee** accounts; **HR** adds/removes
   **Employee** accounts (Team Management panel on the dashboard). Removal is a
   soft delete — the user is signed out instantly and can no longer log in.
+- **HR Operations panel** (Admin/HR): process leave requests like a real HR
+  desk — approve/reject pending requests (approval instantly updates the
+  employee's remaining balance), plus **Late Comers** ranking and a
+  **per-employee attendance report** for the month, all from the shared
+  service layer so the numbers reconcile with the dashboard and the AI.
 - Only Admin can read the AI audit trail; employees never see org-wide data.
 
 Demo credentials (shown on the login page — click an account to fill the form):

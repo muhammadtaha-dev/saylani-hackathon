@@ -440,6 +440,17 @@ export const LEAVE_REQUESTS: LeaveRequest[] = [
     reason: "Personal errand",
     appliedOn: "2026-10-12",
   },
+  {
+    id: "LR-1006",
+    employeeId: "EMP-008", // Ahmed Raza: PENDING casual leave — ready for the HR approve/reject demo
+    type: "casual",
+    start: "2026-10-27",
+    end: "2026-10-28",
+    days: 2,
+    status: "pending",
+    reason: "Family function at home",
+    appliedOn: "2026-10-23",
+  },
 ];
 
 // Patch attendance for approved leave days overlapping seeded months.

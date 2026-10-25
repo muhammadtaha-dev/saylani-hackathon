@@ -543,3 +543,65 @@ export function getMySnapshotService(userId: string) {
     })),
   };
 }
+
+// ---------------------------------------------------------------------------
+// HR operations — per-employee attendance report (Admin/HR only surfaces)
+// ---------------------------------------------------------------------------
+
+export interface EmployeeAttendanceRow {
+  employee_id: string;
+  name: string;
+  department: string;
+  designation: string;
+  present: number;
+  late: number;
+  absent: number;
+  on_leave: number;
+  attendance_rate: number;
+}
+
+export interface AttendanceReportResult {
+  period: PeriodInfo;
+  definition: string;
+  rows: EmployeeAttendanceRow[];
+}
+
+/**
+ * Per-employee attendance breakdown for a period (active staff only).
+ * Shares the same records and rate definition as every other metric, so the
+ * report always reconciles with the dashboard and the AI tools.
+ */
+export function getEmployeeAttendanceReport(
+  department?: DepartmentName,
+  period?: string
+): AttendanceReportResult {
+  const p = resolvePeriod(period);
+  const rows: EmployeeAttendanceRow[] = employeesInScope(department)
+    .filter((e) => e.status === "active")
+    .map((e) => {
+      let present = 0, late = 0, absent = 0, onLeave = 0;
+      for (const r of ATTENDANCE_RECORDS) {
+        if (r.employeeId !== e.id || r.date < p.start || r.date > p.end) continue;
+        if (r.status === "present") present++;
+        else if (r.status === "late") late++;
+        else if (r.status === "absent") absent++;
+        else onLeave++;
+      }
+      const attended = present + late;
+      const denominator = attended + absent;
+      return {
+        employee_id: e.id,
+        name: e.name,
+        department: e.department,
+        designation: e.designation,
+        present,
+        late,
+        absent,
+        on_leave: onLeave,
+        attendance_rate:
+          denominator > 0 ? Math.round((attended / denominator) * 1000) / 10 : 100,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return { period: p, definition: ATTENDANCE_RATE_DEFINITION, rows };
+}

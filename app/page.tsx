@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { AuditModal } from "@/components/audit-modal";
 import { ChatDrawer } from "@/components/chat-drawer";
+import { HrOperations } from "@/components/hr-operations";
 import { KpiGrid } from "@/components/kpi-grid";
 import { MyDashboard } from "@/components/my-dashboard";
 import { SmartLeave } from "@/components/smart-leave";
@@ -189,6 +190,7 @@ export default function Home() {
             </div>
             <KpiGrid kpis={kpis} />
             <SummaryPanel department={department} />
+            <HrOperations department={department} onDataChanged={() => loadDashboard(department)} />
             <TeamManagement role={session.role} selfId={session.userId} />
           </>
         )}

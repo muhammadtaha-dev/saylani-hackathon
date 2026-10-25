@@ -10,8 +10,10 @@
 
 import {
   addLeaveRequest,
+  ATTENDANCE_RECORDS,
   findEmployeeById,
   LEAVE_REQUESTS,
+  type LeaveStatus,
   type LeaveType,
 } from "@/lib/hcmData";
 import { getSession } from "@/lib/session";
@@ -121,4 +123,72 @@ export async function POST(request: Request) {
   addLeaveRequest(newRequest);
 
   return Response.json({ request: newRequest }, { status: 201 });
+}
+
+/**
+ * PATCH /api/leaves — Admin/HR approve or reject a PENDING leave request.
+ * Approval updates the employee's balance automatically (only approved
+ * leaves consume quota) and marks seeded attendance days as "leave" when
+ * the range overlaps recorded working days. Employees cannot access this.
+ */
+export async function PATCH(request: Request) {
+  const session = await getSession();
+  if (!session) {
+    return Response.json({ error: "Not signed in." }, { status: 401 });
+  }
+  if (session.role !== "admin" && session.role !== "hr") {
+    return Response.json(
+      { error: "Only Admin and HR can process leave requests." },
+      { status: 403 }
+    );
+  }
+
+  const body = (await request.json().catch(() => null)) as
+    | { id?: unknown; status?: unknown }
+    | null;
+  const id = typeof body?.id === "string" ? body.id : "";
+  const status = typeof body?.status === "string" ? (body.status as LeaveStatus) : "";
+  if (!id || (status !== "approved" && status !== "rejected")) {
+    return Response.json({ error: "Please provide a request id and status (approved/rejected)." }, { status: 400 });
+  }
+
+  const leaveRequest = LEAVE_REQUESTS.find((lr) => lr.id === id);
+  if (!leaveRequest) {
+    return Response.json({ error: "Leave request not found." }, { status: 404 });
+  }
+  if (leaveRequest.status !== "pending") {
+    return Response.json(
+      { error: `This request was already ${leaveRequest.status}.` },
+      { status: 400 }
+    );
+  }
+
+  leaveRequest.status = status;
+
+  // Keep attendance consistent with the approved leave (seeded days only).
+  if (status === "approved") {
+    for (const record of ATTENDANCE_RECORDS) {
+      if (
+        record.employeeId === leaveRequest.employeeId &&
+        record.date >= leaveRequest.start &&
+        record.date <= leaveRequest.end
+      ) {
+        record.status = "leave";
+        delete record.checkIn;
+      }
+    }
+  }
+
+  const employee = findEmployeeById(leaveRequest.employeeId);
+  return Response.json({
+    request: {
+      ...leaveRequest,
+      employee_name: employee?.name ?? leaveRequest.employeeId,
+      department: employee?.department ?? "",
+    },
+    note:
+      status === "approved"
+        ? "Approved — the employee's remaining balance now reflects this leave."
+        : "Rejected — the employee's balance is unaffected (pending leaves never consumed quota).",
+  });
 }
