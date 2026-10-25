@@ -7,6 +7,8 @@
  * service, tool, or API response.
  */
 
+import { hashPassword } from "./auth";
+
 export type Role = "admin" | "hr" | "employee";
 export type DepartmentName = "Engineering" | "Sales" | "HR";
 export type EmploymentStatus = "active" | "inactive";
@@ -40,6 +42,8 @@ export interface Employee {
   cnic: string;
   /** Sensitive — never leaves this module. */
   bankAccount: string;
+  /** scrypt hash (salt:hash). Empty means "no password set yet". */
+  passwordHash?: string;
 }
 
 export interface AttendanceRecord {
@@ -451,6 +455,69 @@ for (const leave of LEAVE_REQUESTS) {
       delete record.checkIn;
     }
   }
+}
+
+// ---- Authentication seeds and user management ----------------------------
+
+/** Demo credentials (shown on the login page): admin@saylani.com/Admin@123,
+ *  hr@saylani.com/HR@123, taha@saylani.com/Taha@123. Other seeded accounts
+ *  have no password until an Admin or HR sets one. */
+const SEED_PASSWORD_HASHES: Record<string, string> = {
+  "EMP-000":
+    "c3d80427074dcea261d8a205d7ed3784:e3ed0e11ea32f70ff7753e4992d69d46e19ed10dc5a4c57ac3644eaf76ad9e5707fcd6d53cbbffa93c29bb9e410c4c6f5abed42071239136b009e56e651aae04",
+  "EMP-014":
+    "be99150b32abf34aef9aa1279fb8e90e:67b8cffccd9a335382f9083108a57ccc96e6ddc61778567668810a9245b4df7155df67dc6650e50d4d116eaee0c4fbde6c07e7c8a5fcdcd35f7791dd5da0da33",
+  "EMP-001":
+    "4d542a4596c638429cad0d3b75561bb6:40f194b864301e0d3351c308b8a49bfc63c525ec1fabf581bd99ef9581ade2510e02db84c0133f86a23a737979581ea224deec5ace7f7d1ecbaa2d5917848985",
+};
+
+for (const [id, hash] of Object.entries(SEED_PASSWORD_HASHES)) {
+  const employee = EMPLOYEES.find((e) => e.id === id);
+  if (employee) employee.passwordHash = hash;
+}
+
+export interface NewEmployeeInput {
+  name: string;
+  email: string;
+  password: string;
+  role: "hr" | "employee";
+  department: DepartmentName;
+  designation: string;
+}
+
+/** Create an active employee (Admin/HR user management). */
+export function addEmployee(input: NewEmployeeInput): Employee {
+  const nextNumber =
+    EMPLOYEES.reduce((max, e) => {
+      const n = Number(e.id.split("-")[1]);
+      return Number.isFinite(n) && n > max ? n : max;
+    }, 0) + 1;
+  const employee: Employee = {
+    id: `EMP-${String(nextNumber).padStart(3, "0")}`,
+    name: input.name,
+    email: input.email.toLowerCase(),
+    department: input.department,
+    designation: input.designation,
+    role: input.role,
+    status: "active",
+    joinedOn: new Date().toISOString().slice(0, 10),
+    salaryMonthlyPkr: 0,
+    cnic: "",
+    bankAccount: "",
+    passwordHash: hashPassword(input.password),
+  };
+  EMPLOYEES.push(employee);
+  return employee;
+}
+
+/** Soft-delete: deactivated users cannot log in and their session dies. */
+export function setEmployeeStatus(
+  id: string,
+  status: EmploymentStatus
+): Employee | undefined {
+  const employee = findEmployeeById(id);
+  if (employee) employee.status = status;
+  return employee;
 }
 
 // ---- Lookups -------------------------------------------------------------

@@ -1,35 +1,35 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Building2,
   ClipboardCheck,
+  LogOut,
   ScrollText,
-  UserCog,
-  Database,
   ShieldCheck,
+  Database,
 } from "lucide-react";
-import { AiBadge } from "@/components/ai-badge";
 import { AuditModal } from "@/components/audit-modal";
 import { ChatDrawer } from "@/components/chat-drawer";
 import { KpiGrid } from "@/components/kpi-grid";
 import { MyDashboard } from "@/components/my-dashboard";
 import { SmartLeave } from "@/components/smart-leave";
 import { SummaryPanel } from "@/components/summary-panel";
+import { TeamManagement } from "@/components/team-management";
 import {
   ROLE_BADGE_CLASSES,
   ROLE_LABELS,
   type DashboardKpis,
   type MySnapshot,
-  type PublicUser,
   type SessionInfo,
 } from "@/components/types";
 
 const DEPARTMENT_FILTERS = ["All", "Engineering", "Sales", "HR"] as const;
 
 export default function Home() {
+  const router = useRouter();
   const [session, setSession] = useState<SessionInfo | null>(null);
-  const [users, setUsers] = useState<PublicUser[]>([]);
   const [department, setDepartment] = useState<string>("All");
   const [kpis, setKpis] = useState<DashboardKpis | null>(null);
   const [mySnapshot, setMySnapshot] = useState<MySnapshot | null>(null);
@@ -38,9 +38,15 @@ export default function Home() {
   const [auditOpen, setAuditOpen] = useState(false);
   const [booting, setBooting] = useState(true);
 
+  const goToLogin = useCallback(() => router.replace("/login"), [router]);
+
   const loadDashboard = useCallback(async (dept: string) => {
     const query = dept === "All" ? "" : `?department=${encodeURIComponent(dept)}`;
     const res = await fetch(`/api/dashboard${query}`);
+    if (res.status === 401) {
+      goToLogin();
+      return;
+    }
     if (!res.ok) return;
     const data = (await res.json()) as {
       role: string;
@@ -54,31 +60,21 @@ export default function Home() {
       setAiEnabled(data.ai.enabled);
       setAiModel(data.ai.model);
     }
-  }, []);
-
-  const loadSession = useCallback(async () => {
-    const res = await fetch("/api/session");
-    const data = (await res.json()) as { session: SessionInfo | null; users: PublicUser[] };
-    setUsers(data.users ?? []);
-    if (!data.session) {
-      // Demo convenience: start as the Employee account.
-      const created = await fetch("/api/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: "EMP-001" }),
-      });
-      const createdData = (await created.json()) as { session: SessionInfo };
-      setSession(createdData.session);
-    } else {
-      setSession(data.session);
-    }
-    setBooting(false);
-  }, []);
+  }, [goToLogin]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data fetch; setState runs after await
-    loadSession();
-  }, [loadSession]);
+    async function boot() {
+      const res = await fetch("/api/session");
+      const data = (await res.json()) as { session: SessionInfo | null };
+      if (!data.session) {
+        goToLogin();
+        return;
+      }
+      setSession(data.session);
+      setBooting(false);
+    }
+    boot();
+  }, [goToLogin]);
 
   useEffect(() => {
     if (session) {
@@ -87,22 +83,14 @@ export default function Home() {
     }
   }, [session, department, loadDashboard]);
 
-  async function switchUser(userId: string) {
-    const res = await fetch("/api/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId }),
-    });
-    if (!res.ok) return;
-    const data = (await res.json()) as { session: SessionInfo };
-    setSession(data.session);
-    setKpis(null);
-    setMySnapshot(null);
+  async function logOut() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    goToLogin();
   }
 
   const providerLabel = aiEnabled ? `Gemini (${aiModel})` : "Grounded mock · no API key";
 
-  if (booting) {
+  if (booting || !session) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-slate-100">
         <div className="flex items-center gap-3 text-slate-500">
@@ -113,8 +101,8 @@ export default function Home() {
     );
   }
 
-  const isEmployee = session?.role === "employee";
-  const canSeeSummary = session?.role === "admin" || session?.role === "hr";
+  const isEmployee = session.role === "employee";
+  const canSeeSummary = session.role === "admin" || session.role === "hr";
 
   return (
     <main className="mx-auto min-h-screen w-full max-w-7xl px-4 pb-24 pt-5 sm:px-6">
@@ -135,7 +123,7 @@ export default function Home() {
             <Database className="h-3.5 w-3.5 text-emerald-600" aria-hidden />
             {providerLabel}
           </span>
-          {session?.role === "admin" && (
+          {session.role === "admin" && (
             <button
               type="button"
               onClick={() => setAuditOpen(true)}
@@ -145,22 +133,20 @@ export default function Home() {
               Audit trail
             </button>
           )}
-          <label className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-2 py-1">
-            <UserCog className="ml-1 h-4 w-4 text-slate-400" aria-hidden />
-            <span className="sr-only">Switch active session</span>
-            <select
-              value={session?.userId ?? ""}
-              onChange={(e) => switchUser(e.target.value)}
-              className="bg-transparent py-0.5 pr-1 text-xs font-medium text-slate-700 outline-none"
-              aria-label="Active session"
-            >
-              {users.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name} · {ROLE_LABELS[u.role as keyof typeof ROLE_LABELS] ?? u.role} ({u.email})
-                </option>
-              ))}
-            </select>
-          </label>
+          <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ring-1 ${ROLE_BADGE_CLASSES[session.role]}`}>
+              {ROLE_LABELS[session.role]}
+            </span>
+            {session.name}
+          </span>
+          <button
+            type="button"
+            onClick={logOut}
+            className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600"
+          >
+            <LogOut className="h-3.5 w-3.5" aria-hidden />
+            Log out
+          </button>
         </div>
       </header>
 
@@ -203,6 +189,7 @@ export default function Home() {
             </div>
             <KpiGrid kpis={kpis} />
             <SummaryPanel department={department} />
+            <TeamManagement role={session.role} selfId={session.userId} />
           </>
         )}
 
@@ -229,7 +216,6 @@ export default function Home() {
       <footer className="mt-6 flex flex-wrap items-center justify-center gap-2 text-[11px] text-slate-400">
         <ClipboardCheck className="h-3.5 w-3.5" aria-hidden />
         Every AI answer is labelled, logged to ai_logs, permission-checked server-side, and grounded in the database.
-        {session?.role !== "admin" && <AiBadge />}
       </footer>
 
       {session && (

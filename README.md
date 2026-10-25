@@ -28,16 +28,39 @@ With **no key configured the app still works end-to-end**: the assistant runs in
 tool executor and permission layer as the real model, so every acceptance test
 behaves identically (and the demo can survive a provider outage).
 
-## Demo accounts (role switcher in the header)
+Model: the Flash generation current at build time is used (`gemini-2.5-flash` —
+`gemini-1.5-flash` was retired by Google). Tool calling and JSON mode were
+verified live against the real provider.
 
-| Account             | Role     | Scope           | What to try |
-| ------------------- | -------- | --------------- | ----------- |
-| `admin@saylani.com` | Admin    | All departments | Dashboard summary, audit trail modal, all tools |
-| `hr@saylani.com`    | HR       | All departments | Headcount / latecomers / attendance questions, summary |
-| `taha@saylani.com`  | Employee | Engineering     | Own leave balance, Smart Leave, privacy refusals |
+## Authentication & user management
 
-Identity is injected server-side from an HMAC-signed session cookie; the client
-never sends role/user data in API bodies.
+The app is behind real authentication:
+
+- **Login page** (`/login`) with email + password. Passwords are stored as
+  **scrypt hashes**; sessions are HMAC-signed, expire after 7 days, and die
+  immediately when an account is removed. Failed logins are throttled per
+  email (8 attempts → 15-minute lock).
+- **Admin** adds/removes **HR and Employee** accounts; **HR** adds/removes
+  **Employee** accounts (Team Management panel on the dashboard). Removal is a
+  soft delete — the user is signed out instantly and can no longer log in.
+- Only Admin can read the AI audit trail; employees never see org-wide data.
+
+Demo credentials (shown on the login page — click an account to fill the form):
+
+| Email               | Password    | Role     |
+| ------------------- | ----------- | -------- |
+| `admin@saylani.com` | `Admin@123` | Admin    |
+| `hr@saylani.com`    | `HR@123`    | HR       |
+| `taha@saylani.com`  | `Taha@123`  | Employee |
+
+Other seeded accounts have no password until an Admin/HR creates their login.
+
+## Demo accounts
+
+Sign in on the login page (credentials above). Identity is injected server-side
+from the signed session cookie; the client never sends role/user data in API
+bodies, and the old demo "role switcher" has been removed in favour of real
+authentication.
 
 ## Architecture
 
@@ -124,8 +147,10 @@ configured, `AiTimeoutError` → friendly fallback + `outcome: timeout` log row.
 - `ai_logs`, rate-limit counters, conversations and newly submitted leaves are
   **in-memory per server instance** (Vercel serverless may reset them); this is a
   demo-store tradeoff — the append-only + redaction behaviour is identical.
-- The session switcher is a signed-cookie demo identity provider, not real auth;
-  swapping in a real provider only changes `lib/session.ts`.
+- A deployment fallback **Gemini key is embedded in `lib/gemini.ts` at the
+  repository owner's explicit request** so the live Vercel demo works without
+  dashboard configuration (env vars always take precedence). It is rotated
+  easily and should be removed for any serious deployment.
 - Seed attendance covers March 2026 and October 2026; other periods answer
   plainly "no records found for that period" (which is itself a spec behaviour).
 

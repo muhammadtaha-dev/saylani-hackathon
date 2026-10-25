@@ -185,9 +185,15 @@ export async function POST(request: Request) {
       if (!bullets) outcome = "validation_failed";
     }
   } catch (err) {
-    bullets = null;
+    // Fail soft: provider down/timeout -> deterministic grounded bullets.
     outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
     errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
+    const candidates = mockSummaryBullets(kpis);
+    const grounded = candidates.filter((b) => bulletIsGrounded(b, kpis));
+    if (grounded.length >= 3) {
+      bullets = grounded;
+      provider = "mock";
+    }
   }
 
   appendAiLog(session, {

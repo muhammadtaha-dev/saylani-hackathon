@@ -122,6 +122,7 @@ export async function POST(request: Request) {
   let toolsUsed: string[] = [];
   let outcome: AiOutcome = "answered";
   let provider: "gemini" | "mock" = "mock";
+  let fallbackUsed = false;
   let promptTokens = 0;
   let completionTokens = 0;
   let feature: "chat" | "policy" = "chat";
@@ -186,14 +187,20 @@ export async function POST(request: Request) {
       }
     }
   } catch (err) {
-    if (err instanceof AiTimeoutError) {
-      answer = FALLBACK_TIMEOUT;
-      outcome = "timeout";
-      errorCode = "ai_timeout";
-    } else {
-      answer = FALLBACK_PROVIDER;
-      outcome = "fallback";
-      errorCode = "provider_error";
+    // Fail soft: on any provider failure, fall back to the grounded mock so
+    // the user still receives a real, database-backed answer.
+    errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
+    outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
+    try {
+      const mock = await runMockAssistant(message, session);
+      answer = mock.answer;
+      toolsUsed = mock.toolsUsed;
+      feature = mock.feature === "policy" ? "policy" : "chat";
+      provider = "mock";
+      fallbackUsed = true;
+    } catch {
+      answer = err instanceof AiTimeoutError ? FALLBACK_TIMEOUT : FALLBACK_PROVIDER;
+      provider = AI_ENABLED ? "gemini" : "mock";
     }
   }
 
@@ -225,7 +232,7 @@ export async function POST(request: Request) {
       date: now.dateLabel,
       timezone: now.timezone,
       policy_version: POLICY_VERSION,
-      provider: AI_ENABLED ? "gemini" : "mock",
+      provider: fallbackUsed ? "mock (provider fallback)" : AI_ENABLED ? "gemini" : "mock",
     },
   });
 }

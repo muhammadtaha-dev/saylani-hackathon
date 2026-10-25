@@ -143,3 +143,18 @@ export function guardRequest(text: string): GuardResult {
 export function isLeaveType(value: string): value is LeaveType {
   return ["annual", "sick", "casual"].includes(value);
 }
+
+// ---------------------------------------------------------------------------
+// User management permissions: Admin manages HR + Employees; HR manages
+// Employees only. Nobody manages Admins through this surface.
+// ---------------------------------------------------------------------------
+
+export function canManageUser(actor: Role, targetRole: Role): boolean {
+  if (actor === "admin") return targetRole === "hr" || targetRole === "employee";
+  if (actor === "hr") return targetRole === "employee";
+  return false;
+}
+
+export function canListUsers(actor: Role): boolean {
+  return actor === "admin" || actor === "hr";
+}

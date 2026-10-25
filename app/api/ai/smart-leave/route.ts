@@ -29,8 +29,6 @@ import {
 
 const MANUAL_FORM_MESSAGE =
   "I couldn't work out the exact details from that sentence. The manual leave form below is ready for you — nothing has been submitted.";
-const PROVIDER_DOWN_MESSAGE =
-  "The AI helper is unavailable right now. The manual leave form below is ready for you — nothing has been submitted.";
 
 interface SuggestionResponse {
   suggestion?: LeaveSuggestion & { warnings: string[] };
@@ -94,6 +92,7 @@ export async function POST(request: Request) {
   let errorCode: string | null = null;
 
   let suggestion: (LeaveSuggestion & { warnings: string[] }) | null = null;
+  let providerFailed = false;
 
   const finishWithFallback = (message: string, code: string, kind: AiOutcome) => {
     outcome = kind;
@@ -157,10 +156,11 @@ export async function POST(request: Request) {
         break;
       }
     } catch (err) {
-      if (err instanceof AiTimeoutError) {
-        return finishWithFallback(PROVIDER_DOWN_MESSAGE, "ai_timeout", "timeout");
-      }
-      return finishWithFallback(PROVIDER_DOWN_MESSAGE, "provider_error", "fallback");
+      // Fail soft: record the failure and let the deterministic parser below
+      // produce the suggestion instead of showing the user an error.
+      providerFailed = true;
+      outcome = err instanceof AiTimeoutError ? "timeout" : "fallback";
+      errorCode = err instanceof AiTimeoutError ? "ai_timeout" : "provider_error";
     }
   }
 
@@ -185,12 +185,12 @@ export async function POST(request: Request) {
     }
     if (!suggestion) {
       return finishWithFallback(
-        AI_ENABLED ? MANUAL_FORM_MESSAGE : MANUAL_FORM_MESSAGE,
-        AI_ENABLED ? errorCode ?? "unresolved_dates" : "unresolved_dates",
-        "validation_failed"
+        MANUAL_FORM_MESSAGE,
+        providerFailed ? errorCode ?? "provider_error" : "unresolved_dates",
+        providerFailed ? outcome === "timeout" ? "timeout" : "fallback" : "validation_failed"
       );
     }
-    provider = AI_ENABLED ? "gemini" : "mock";
+    provider = providerFailed ? "mock" : AI_ENABLED ? "gemini" : "mock";
   }
 
   // Balance check where applicable -> pre-fill with a warning (Spec §8.8).
