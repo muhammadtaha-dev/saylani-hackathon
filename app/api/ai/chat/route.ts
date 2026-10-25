@@ -20,7 +20,7 @@ import {
   usageOf,
   AiTimeoutError,
 } from "@/lib/gemini";
-import { appendAuditEvent, appendAuditEventAsync, ipFromRequest } from "@/lib/audit";
+import { appendAuditEvent, ipFromRequest } from "@/lib/audit";
 import {
   checkFeaturePermission,
   guardRequest,
@@ -248,7 +248,6 @@ export async function POST(request: Request) {
       error_code: errorCode,
     },
   });
-  void appendAuditEventAsync; // (kept for routes that need durable writes)
 
   return Response.json({
     answer,

@@ -247,7 +247,8 @@ async function attendanceInPeriod(
     .select("*")
     .gte("date", period.start)
     .lte("date", period.end);
-  if (scopeIds) query = query.in("employee_id", scopeIds);
+  // PostgREST rejects empty in() lists; use an impossible id instead.
+  if (scopeIds) query = query.in("employee_id", scopeIds.length ? scopeIds : ["00000000-0000-0000-0000-000000000000"]);
   const { data, error } = await query;
   if (error) throw new Error(error.message);
   return (data ?? []) as AttendanceRow[];

@@ -19,7 +19,6 @@ import {
   getMyLeaveBalanceService,
   getTeamOverlapService,
   TIMEZONE,
-  todayInTimezone,
   todayIso,
 } from "@/lib/services";
 import {
@@ -241,8 +240,6 @@ export async function POST(request: Request) {
       latency_ms: Date.now() - started,
     },
   });
-
-  void todayInTimezone; // re-exported for callers; not needed here
 
   return Response.json({
     suggestion: { ...suggestion, warnings: suggestion.warnings },
